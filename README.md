@@ -51,8 +51,10 @@ They take one command and a restart. The microphone works either way.
    them automatically.
 
 The control page shows whether your phone is connected and whether the mic
-and camera are live. To finish, press **Stop Phone Mic Cam**. If you close
-the page, open the app again and it reopens the page.
+and camera are live. While they stream, it also shows live numbers: the
+camera's frames per second, data rate and frames skipped, and the mic's data
+rate and lag. To finish, press **Stop Phone Mic Cam**. If you close the page,
+open the app again and it reopens the page.
 
 Keep the page open on the phone and its screen on. The page tries to stop the
 screen from locking.
@@ -207,6 +209,19 @@ packaging/build-deb.sh
 This writes `dist/phone-mic-cam_<version>_all.deb`. The version comes from
 `__version__` in `phone_mic_cam.py`. The `packaging/` folder holds the
 launcher, app entry, icon, driver settings and install script.
+
+### Running the tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The tests need only the app's own Python dependencies and use only
+`127.0.0.1`, without touching PulseAudio or the webcam driver. The page
+script check needs `node` and the package check needs `dpkg-deb`; each is
+skipped when its tool isn't installed. GitHub Actions runs the same tests on
+every push and pull request, and keeps the built `.deb` as a download on
+each run.
 
 ## Contributing
 

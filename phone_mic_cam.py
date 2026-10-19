@@ -47,7 +47,7 @@ except ImportError as e:
     sys.exit(f"Missing Python package '{e.name}'. Install with:  "
              "sudo apt install python3-aiohttp python3-qrcode  (or pip install -r requirements.txt)")
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 RATE = 48000                      # samples/sec, mono, signed 16-bit
 CHUNK_MS = 10
@@ -119,6 +119,12 @@ def create_virtual_mic():
     return module_id, previous
 
 
+def mic_buffer_ms() -> int:
+    """Audio received from the phone but not yet played into the mic: its lag."""
+    with buf_lock:
+        return len(buf) * 1000 // (RATE * 2)
+
+
 def feed(data: bytes):
     if len(data) % 2:
         return
@@ -174,19 +180,29 @@ class VirtualCam:
         self.device = device
         self.proc = None
         self.frame = None
+        self.skipped = 0                 # frames replaced before ffmpeg took them
         self.cond = threading.Condition()
         threading.Thread(target=self._run, daemon=True).start()
 
     def push(self, jpeg: bytes):
         with self.cond:
+            if self.frame is not None:
+                self.skipped += 1
             self.frame = jpeg            # keep only the newest frame (low latency)
             self.cond.notify()
 
     def _spawn(self):
         return subprocess.Popen(
             ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-fflags", "nobuffer", "-f", "mjpeg", "-framerate", str(CAM_FPS),
-             "-i", "pipe:0", "-pix_fmt", "yuv420p", "-f", "v4l2", self.device],
+             # The format is known, so skip probing the first frames: the
+             # first picture reaches the webcam in ~0.25 s instead of ~2 s.
+             # Without probing ffmpeg misjudges the frame rate (1200k fps)
+             # and drops almost every frame, so pass frames through as they
+             # arrive instead of retiming them.
+             "-fflags", "nobuffer", "-probesize", "32", "-analyzeduration", "0",
+             "-f", "mjpeg", "-framerate", str(CAM_FPS),
+             "-i", "pipe:0", "-fps_mode", "passthrough",
+             "-pix_fmt", "yuv420p", "-f", "v4l2", self.device],
             stdin=subprocess.PIPE,
         )
 
@@ -414,6 +430,7 @@ const canvas = document.createElement('canvas');
 canvas.width = CAM_W; canvas.height = CAM_H;
 const g = canvas.getContext('2d');
 let camStream, camWs, camTimer, camRunning = false, encoding = false, facing = 'user';
+let loopId = 0;                   // bumped to end the current frame loop
 const camSay = t => camSt.textContent = t;
 
 function camConnect() {
@@ -446,16 +463,35 @@ function sendFrame() {
                 'image/jpeg', 0.7);
 }
 
+// Send each new camera frame once. requestVideoFrameCallback fires when the
+// video element shows a new frame; a fixed timer could send one frame twice
+// or skip one. Fall back to the timer where it's missing.
+function startFrameLoop() {
+  const id = ++loopId;
+  clearInterval(camTimer);
+  if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
+    camTimer = setInterval(sendFrame, 1000 / CAM_FPS);
+    return;
+  }
+  const step = () => {
+    if (!camRunning || id !== loopId) return;
+    sendFrame();
+    video.requestVideoFrameCallback(step);
+  };
+  video.requestVideoFrameCallback(step);
+}
+
 async function startCam() {
   await openCamera();
   video.style.display = 'block';
   camRunning = true; camConnect(); keepAwake();
-  camTimer = setInterval(sendFrame, 1000 / CAM_FPS);
+  startFrameLoop();
   camBtn.textContent = 'Stop camera'; camBtn.classList.add('on');
 }
 
 function stopCam() {
   camRunning = false;
+  loopId++;
   clearInterval(camTimer);
   if (camWs) camWs.close();
   if (camStream) camStream.getTracks().forEach(t => t.stop());
@@ -474,7 +510,7 @@ camBtn.onclick = async () => {
 };
 flipBtn.onclick = async () => {
   facing = facing === 'user' ? 'environment' : 'user';
-  if (camRunning) try { await openCamera(); }
+  if (camRunning) try { await openCamera(); startFrameLoop(); }
   catch (e) { report('camera', e); camSay(explain('camera', e)); }
 };
 </script></body></html>"""
@@ -498,6 +534,9 @@ CONTROL_PAGE = """<!doctype html>
   .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#555;
        margin-right:8px}
   .on .dot{background:#2c8}  .live .dot{background:#e44}
+  .stats{grid-column:2;font-size:13px;opacity:.65;margin-top:-4px;
+         font-variant-numeric:tabular-nums}
+  .stats:empty{display:none}
   #camfix{max-width:440px;font-size:14px;line-height:1.5;background:#3a2a10;color:#fc6;
           border-radius:10px;padding:12px 14px;display:none;word-break:break-word}
   button{border:none;border-radius:12px;padding:12px 28px;font-size:16px;font-weight:600;
@@ -515,7 +554,9 @@ CONTROL_PAGE = """<!doctype html>
 </ol>
 <div id="status">
   <span>Microphone</span><span id="mic"><span class="dot"></span>…</span>
+  <span id="micstats" class="stats"></span>
   <span>Camera</span><span id="cam"><span class="dot"></span>…</span>
+  <span id="camstats" class="stats"></span>
 </div>
 <div id="camfix"></div>
 <button id="stop">Stop Phone Mic Cam</button>
@@ -549,6 +590,12 @@ async function refresh() {
   const fix = document.getElementById('camfix');
   fix.textContent = s.camera_problem || '';
   fix.style.display = s.camera_problem ? 'block' : 'none';
+  const t = s.stats;
+  document.getElementById('micstats').textContent =
+    s.mic_connected && t.mic_kb_per_sec ? `${t.mic_kb_per_sec} KB/s · ${t.mic_buffer_ms} ms lag` : '';
+  document.getElementById('camstats').textContent = s.cam_connected
+    ? `${t.cam_fps} fps · ${t.cam_kb_per_sec.toLocaleString()} KB/s · ${t.cam_skipped} frames skipped`
+    : '';
 }
 document.getElementById('stop').onclick = async () => {
   const btn = document.getElementById('stop');
@@ -557,6 +604,8 @@ document.getElementById('stop').onclick = async () => {
   stopped = true;
   btn.textContent = 'Stopped';
   show('mic', 'Stopped. Your previous microphone is back.'); show('cam', 'Stopped');
+  document.getElementById('micstats').textContent = '';
+  document.getElementById('camstats').textContent = '';
   document.getElementById('camfix').style.display = 'none';
 };
 refresh(); setInterval(refresh, 1000);
@@ -586,6 +635,7 @@ async def ws_handler(request):
         await ws.send_str("on" if mic_wanted else "off")
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
+                mic_meter.add(len(msg.data))
                 feed(msg.data)
     finally:
         clients.discard(ws)
@@ -608,6 +658,7 @@ async def video_handler(request):
     try:
         async for msg in ws:
             if msg.type == WSMsgType.BINARY and msg.data[:2] == b"\xff\xd8":   # JPEG
+                cam_meter.add(len(msg.data))
                 cam.push(msg.data)
     finally:
         clients.discard(ws)
@@ -732,6 +783,65 @@ def mic_watch_hooks(enabled):
     return start, stop
 
 
+class Meter:
+    """Counts messages and bytes from the phone; tick() turns them into rates."""
+
+    def __init__(self):
+        self.count = self.bytes = 0
+        self.per_sec = self.bytes_per_sec = 0.0
+        self._last = (0, 0, time.monotonic())
+
+    def add(self, nbytes):
+        self.count += 1
+        self.bytes += nbytes
+
+    def tick(self):
+        count, nbytes, then = self._last
+        now = time.monotonic()
+        elapsed = (now - then) or 1e-9
+        self.per_sec = (self.count - count) / elapsed
+        self.bytes_per_sec = (self.bytes - nbytes) / elapsed
+        self._last = (self.count, self.bytes, now)
+
+
+mic_meter = Meter()
+cam_meter = Meter()
+
+
+def stats():
+    return {
+        "cam_fps": round(cam_meter.per_sec, 1),
+        "cam_kb_per_sec": round(cam_meter.bytes_per_sec / 1000),
+        "cam_skipped": cam.skipped if cam else 0,
+        "mic_kb_per_sec": round(mic_meter.bytes_per_sec / 1000),
+        "mic_buffer_ms": mic_buffer_ms(),
+    }
+
+
+def stats_hooks():
+    task = None
+
+    async def tick_every_second():
+        while True:
+            await asyncio.sleep(1)
+            mic_meter.tick()
+            cam_meter.tick()
+
+    async def start(app):
+        nonlocal task
+        task = asyncio.create_task(tick_every_second())
+
+    async def stop(app):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return start, stop
+
+
 async def close_clients(app):
     """Close open phone connections so Ctrl+C doesn't wait for them to time out."""
     for ws in list(clients):
@@ -808,6 +918,7 @@ def control_page_hooks(phone_url, open_browser):
             "mic_always_on": mic_always_on,
             "cam_connected": bool(cam_clients),
             "camera_problem": camera_problem,
+            "stats": stats(),
         })
 
     async def stop_app(request):
@@ -912,6 +1023,9 @@ def main():
     start_watch, stop_watch = mic_watch_hooks(not args.mic_always_on)
     app.on_startup.append(start_desktop)
     app.on_startup.append(start_watch)
+    start_stats, stop_stats = stats_hooks()
+    app.on_startup.append(start_stats)
+    app.on_cleanup.append(stop_stats)
     app.on_shutdown.append(close_clients)
     app.on_cleanup.append(stop_watch)
     app.on_cleanup.append(stop_desktop)
