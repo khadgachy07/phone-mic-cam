@@ -91,8 +91,8 @@ Delete it to remove the certificate too.
 ## How it works
 
 ```
- Phone browser                              Computer (phone_mic_cam.py)
- ─────────────                              ───────────────────────────
+ Phone browser                              Computer (phone_mic_cam)
+ ─────────────                              ────────────────────────
  mic  ──► 48 kHz PCM ───── wss /ws ──────►  PulseAudio pipe source "Phone Mic"
  cam  ──► JPEG frames ──── wss /video ───►  ffmpeg ──► v4l2loopback "Phone Cam"
 ```
@@ -162,7 +162,7 @@ git clone https://github.com/khadgachy07/phone-mic-cam.git
 cd phone-mic-cam
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python phone_mic_cam.py
+.venv/bin/python -m phone_mic_cam
 ```
 
 Options: `--no-browser` (don't open the control page), `--mic-always-on`,
@@ -212,8 +212,29 @@ packaging/build-deb.sh
 ```
 
 This writes `dist/phone-mic-cam_<version>_all.deb`. The version comes from
-`__version__` in `phone_mic_cam.py`. The `packaging/` folder holds the
-launcher, app entry, icon, driver settings and install script.
+`__version__` in `phone_mic_cam/__init__.py`. The `packaging/` folder holds
+the launcher, app entry, icon, driver settings and install script.
+
+### Code layout
+
+```
+phone_mic_cam/
+├── __init__.py        version
+├── __main__.py        entry point: python3 -m phone_mic_cam
+├── app.py             startup, shutdown, command-line options, certificate, log file
+├── audio.py           Phone Mic: virtual mic, audio writer, automatic on/off
+├── camera.py          Phone Cam: ffmpeg, frame handling, driver diagnosis
+├── phone_server.py    what the phone talks to: page, mic, camera, error reports
+├── control_page.py    the control page on this computer: status, Stop, reopening
+├── stats.py           live numbers shown on the control page
+└── web/
+    ├── phone.html  phone.js      the page on the phone
+    └── control.html  control.js  the control page on this computer
+```
+
+The pages are plain HTML and JavaScript with no build step. Each page's
+script is inlined into its HTML when the app starts, so it's served as one
+document behind the pairing code, as before.
 
 ### Running the tests
 

@@ -8,4 +8,4 @@
 if [ ! -t 1 ]; then
     set -- --log-file "${XDG_STATE_HOME:-$HOME/.local/state}/phone-mic-cam/last-run.log" "$@"
 fi
-exec python3 -u /usr/share/phone-mic-cam/phone_mic_cam.py "$@"
+PYTHONPATH="/usr/share/phone-mic-cam${PYTHONPATH:+:$PYTHONPATH}" exec python3 -u -m phone_mic_cam "$@"

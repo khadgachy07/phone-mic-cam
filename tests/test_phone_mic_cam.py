@@ -1,10 +1,10 @@
-"""Tests for phone_mic_cam.py. Run from the repository root:
+"""Tests for the phone_mic_cam package. Run from the repository root:
 
     python3 -m unittest discover -s tests -v
 
 They need only the app's own dependencies (aiohttp, qrcode). They don't touch
 PulseAudio, the webcam driver or the network beyond 127.0.0.1. Checks that need
-node or dpkg-deb are skipped when those aren't installed.
+node, ffmpeg or dpkg-deb are skipped when those aren't installed.
 """
 import asyncio
 import contextlib
@@ -13,10 +13,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -26,30 +28,37 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WEB = os.path.join(ROOT, "phone_mic_cam", "web")
 sys.path.insert(0, ROOT)
-import phone_mic_cam as app  # noqa: E402
+import phone_mic_cam  # noqa: E402
+from phone_mic_cam import app, audio, camera, control_page, phone_server, stats  # noqa: E402
+
+
+def read_web(name):
+    with open(os.path.join(WEB, name), encoding="utf-8") as f:
+        return f.read()
 
 
 def reset_state():
-    app.cam = None
-    app.camera_problem = None
-    app.clients.clear()
-    app.mic_clients.clear()
-    app.cam_clients.clear()
-    app.mic_wanted = True
-    app.mic_always_on = False
-    app.mic_meter = app.Meter()
-    app.cam_meter = app.Meter()
-    with app.buf_lock:
-        app.buf.clear()
+    camera.cam = None
+    camera.camera_problem = None
+    phone_server.clients.clear()
+    audio.mic_clients.clear()
+    phone_server.cam_clients.clear()
+    audio.mic_wanted = True
+    audio.mic_always_on = False
+    stats.mic_meter = stats.Meter()
+    stats.cam_meter = stats.Meter()
+    with audio.buf_lock:
+        audio.buf.clear()
 
 
 def phone_app():
     a = web.Application()
-    a.router.add_get("/", app.index)
-    a.router.add_get("/ws", app.ws_handler)
-    a.router.add_get("/video", app.video_handler)
-    a.router.add_post("/report", app.report_handler)
+    a.router.add_get("/", phone_server.index)
+    a.router.add_get("/ws", phone_server.ws_handler)
+    a.router.add_get("/video", phone_server.video_handler)
+    a.router.add_post("/report", phone_server.report_handler)
     return a
 
 
@@ -64,16 +73,16 @@ class FakeCam:
 
 class PairingTest(unittest.TestCase):
     def test_token_is_required(self):
-        self.assertTrue(app.authorized(make_mocked_request("GET", f"/?t={app.TOKEN}")))
-        self.assertFalse(app.authorized(make_mocked_request("GET", "/?t=wrong")))
-        self.assertFalse(app.authorized(make_mocked_request("GET", "/")))
+        self.assertTrue(phone_server.authorized(make_mocked_request("GET", f"/?t={phone_server.TOKEN}")))
+        self.assertFalse(phone_server.authorized(make_mocked_request("GET", "/?t=wrong")))
+        self.assertFalse(phone_server.authorized(make_mocked_request("GET", "/")))
 
 
 class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         reset_state()
         # Never use a real webcam device, even on a machine that has Phone Cam.
-        self.no_device = mock.patch.object(app, "find_loopback_device", return_value=None)
+        self.no_device = mock.patch.object(camera, "find_loopback_device", return_value=None)
         self.no_device.start()
         self.client = TestClient(TestServer(phone_app()))
         await self.client.start_server()
@@ -84,10 +93,10 @@ class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
         reset_state()
 
     async def test_page_needs_token(self):
-        for query, status in [("", 403), ("?t=wrong", 403), (f"?t={app.TOKEN}", 200)]:
+        for query, status in [("", 403), ("?t=wrong", 403), (f"?t={phone_server.TOKEN}", 200)]:
             resp = await self.client.get("/" + query)
             self.assertEqual(resp.status, status, query)
-        resp = await self.client.get(f"/?t={app.TOKEN}")
+        resp = await self.client.get(f"/?t={phone_server.TOKEN}")
         self.assertIn("Start mic", await resp.text())
 
     async def test_streams_need_token(self):
@@ -97,73 +106,73 @@ class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cm.exception.status, 403)
 
     async def test_mic_gets_state_and_audio_reaches_buffer(self):
-        app.mic_wanted = False
-        ws = await self.client.ws_connect(f"/ws?t={app.TOKEN}")
+        audio.mic_wanted = False
+        ws = await self.client.ws_connect(f"/ws?t={phone_server.TOKEN}")
         self.assertEqual((await ws.receive()).data, "off")
         await ws.send_bytes(bytes(960))          # 10 ms of 48 kHz mono s16
         for _ in range(50):
-            if app.mic_meter.bytes:
+            if stats.mic_meter.bytes:
                 break
             await asyncio.sleep(0.01)
-        self.assertEqual(app.mic_meter.bytes, 960)
-        self.assertEqual(app.mic_buffer_ms(), 10)
+        self.assertEqual(stats.mic_meter.bytes, 960)
+        self.assertEqual(audio.mic_buffer_ms(), 10)
         await ws.close()
 
     async def test_mic_wanted_changes_are_sent(self):
-        app.mic_wanted = False
-        ws = await self.client.ws_connect(f"/ws?t={app.TOKEN}")
+        audio.mic_wanted = False
+        ws = await self.client.ws_connect(f"/ws?t={phone_server.TOKEN}")
         await ws.receive()
         with contextlib.redirect_stdout(io.StringIO()):
-            await app.set_mic_wanted(True)
+            await audio.set_mic_wanted(True)
         self.assertEqual((await ws.receive()).data, "on")
         await ws.close()
 
     async def test_video_without_camera_closes_with_4000(self):
-        ws = await self.client.ws_connect(f"/video?t={app.TOKEN}")
+        ws = await self.client.ws_connect(f"/video?t={phone_server.TOKEN}")
         await ws.receive()
         self.assertEqual(ws.close_code, 4000)
 
     async def test_camera_loaded_after_startup_is_picked_up(self):
         # Regression: the camera was only set up at startup, so loading the
         # driver as the control page suggests didn't help until a restart.
-        app.camera_problem = "The webcam driver isn't loaded."
+        camera.camera_problem = "The webcam driver isn't loaded."
         self.no_device.stop()
-        with mock.patch.object(app, "find_loopback_device", return_value="/dev/video99"), \
-                mock.patch.object(app.shutil, "which", return_value="/usr/bin/ffmpeg"), \
-                mock.patch.object(app, "VirtualCam", side_effect=lambda dev: FakeCam()), \
+        with mock.patch.object(camera, "find_loopback_device", return_value="/dev/video99"), \
+                mock.patch.object(shutil, "which", return_value="/usr/bin/ffmpeg"), \
+                mock.patch.object(camera, "VirtualCam", side_effect=lambda dev: FakeCam()), \
                 contextlib.redirect_stdout(io.StringIO()):
-            ws = await self.client.ws_connect(f"/video?t={app.TOKEN}")
+            ws = await self.client.ws_connect(f"/video?t={phone_server.TOKEN}")
             await ws.send_bytes(b"\xff\xd8 frame")
             for _ in range(50):
-                if app.cam and app.cam.frames:
+                if camera.cam and camera.cam.frames:
                     break
                 await asyncio.sleep(0.01)
             await ws.close()
         self.no_device.start()
-        self.assertEqual(app.cam.frames, [b"\xff\xd8 frame"])
-        self.assertIsNone(app.camera_problem)
+        self.assertEqual(camera.cam.frames, [b"\xff\xd8 frame"])
+        self.assertIsNone(camera.camera_problem)
 
     async def test_starting_live_drops_audio_left_from_last_session(self):
         # Regression: audio left in the buffer when the mic went to Ready was
         # played at the start of the next recording.
-        app.mic_wanted = False
-        app.feed(bytes(9600))                      # 100 ms left over
+        audio.mic_wanted = False
+        audio.feed(bytes(9600))                      # 100 ms left over
         with contextlib.redirect_stdout(io.StringIO()):
-            await app.set_mic_wanted(True)
-        self.assertEqual(app.mic_buffer_ms(), 0)
+            await audio.set_mic_wanted(True)
+        self.assertEqual(audio.mic_buffer_ms(), 0)
 
     async def test_video_forwards_only_jpeg(self):
-        app.cam = FakeCam()
-        ws = await self.client.ws_connect(f"/video?t={app.TOKEN}")
+        camera.cam = FakeCam()
+        ws = await self.client.ws_connect(f"/video?t={phone_server.TOKEN}")
         await ws.send_bytes(b"\xff\xd8 a jpeg")
         await ws.send_bytes(b"not a jpeg")
         for _ in range(50):
-            if app.cam.frames:
+            if camera.cam.frames:
                 break
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.05)
-        self.assertEqual(app.cam.frames, [b"\xff\xd8 a jpeg"])
-        self.assertEqual(app.cam_meter.count, 1)
+        self.assertEqual(camera.cam.frames, [b"\xff\xd8 a jpeg"])
+        self.assertEqual(stats.cam_meter.count, 1)
         await ws.close()
 
 
@@ -185,15 +194,15 @@ class ReportTest(unittest.IsolatedAsyncioTestCase):
         ok = {"what": "camera"}
         self.assertEqual((await self.post("", json=ok))[0], 403)
         self.assertEqual((await self.post("?t=wrong", json=ok))[0], 403)
-        self.assertEqual((await self.post(f"?t={app.TOKEN}", data=b"hello"))[0], 400)
-        self.assertEqual((await self.post(f"?t={app.TOKEN}", json=[1]))[0], 400)
-        self.assertEqual((await self.post(f"?t={app.TOKEN}", data=b"x" * 8192))[0], 413)
+        self.assertEqual((await self.post(f"?t={phone_server.TOKEN}", data=b"hello"))[0], 400)
+        self.assertEqual((await self.post(f"?t={phone_server.TOKEN}", json=[1]))[0], 400)
+        self.assertEqual((await self.post(f"?t={phone_server.TOKEN}", data=b"x" * 8192))[0], 413)
 
     async def test_logs_one_clean_line(self):
         report = {"what": "camera", "name": "NotAllowedError",
                   "message": "line1\nFAKE log line\x1b[31m" + "A" * 500,
                   "mic": "Ready", "page": "visible"}
-        status, log = await self.post(f"?t={app.TOKEN}", json=report)
+        status, log = await self.post(f"?t={phone_server.TOKEN}", json=report)
         self.assertEqual(status, 204)
         self.assertEqual(log.count("\n"), 1)
         self.assertIn("Phone camera refused: NotAllowedError: line1?FAKE log line?[31m", log)
@@ -216,7 +225,7 @@ class LogFileTest(unittest.TestCase):
         with open(self.log, "w") as f:
             f.write("12:00:00 Phone camera refused: NotAllowedError\n")
         with mock.patch.object(app, "port_free", return_value=False), \
-                mock.patch.object(app, "running_copy_url", return_value="http://127.0.0.1:1/?t=x"), \
+                mock.patch.object(control_page, "running_copy_url", return_value="http://127.0.0.1:1/?t=x"), \
                 mock.patch.object(app, "log_to_file") as log_to_file, \
                 contextlib.redirect_stdout(io.StringIO()):
             app.main(["--log-file", self.log, "--no-browser"])
@@ -228,7 +237,7 @@ class LogFileTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.log))
         with open(self.log, "w") as f:
             f.write("previous run\n")
-        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); import phone_mic_cam as a; "
+        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); from phone_mic_cam import app as a; "
                 "a.log_to_file(sys.argv[2]); print('from python'); "
                 "os.system('echo from a child process')")
         subprocess.run([sys.executable, "-c", code, ROOT, self.log], check=True)
@@ -255,7 +264,7 @@ class LogFileTest(unittest.TestCase):
                        env=env, check=True, stdout=subprocess.PIPE)   # stdout is not a terminal
         with open(args_file) as f:
             args = f.read().split("\n")
-        self.assertEqual(args[:5], ["-u", "/usr/share/phone-mic-cam/phone_mic_cam.py",
+        self.assertEqual(args[:6], ["-u", "-m", "phone_mic_cam",
                                     "--log-file", self.log, "--no-browser"])
         with open(self.log) as f:
             self.assertEqual(f.read(), "running copy's log\n")
@@ -263,22 +272,22 @@ class LogFileTest(unittest.TestCase):
 
 class CleanTest(unittest.TestCase):
     def test_replaces_unprintable_and_truncates(self):
-        self.assertEqual(app.clean("a\nb\tc\x1bd", 100), "a?b?c?d")
-        self.assertEqual(app.clean("x" * 50, 10), "x" * 10)
-        self.assertEqual(app.clean(None, 10), "None")
+        self.assertEqual(phone_server.clean("a\nb\tc\x1bd", 100), "a?b?c?d")
+        self.assertEqual(phone_server.clean("x" * 50, 10), "x" * 10)
+        self.assertEqual(phone_server.clean(None, 10), "None")
 
 
 class ControlPageTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         reset_state()
         self.tmp = tempfile.TemporaryDirectory()
-        self.patch = mock.patch.object(app, "CONTROL_FILE", os.path.join(self.tmp.name, "url"))
+        self.patch = mock.patch.object(control_page, "CONTROL_FILE", os.path.join(self.tmp.name, "url"))
         self.patch.start()
-        self.start, self.stop = app.control_page_hooks("https://192.0.2.1:8443/?t=x",
+        self.start, self.stop = control_page.hooks("https://192.0.2.1:8443/?t=x",
                                                        open_browser=False)
         with contextlib.redirect_stdout(io.StringIO()):
             await self.start(None)
-        with open(app.CONTROL_FILE) as f:
+        with open(control_page.CONTROL_FILE) as f:
             self.url = f.read()
         self.base = self.url.split("/?")[0]
         self.session = aiohttp.ClientSession()
@@ -295,7 +304,7 @@ class ControlPageTest(unittest.IsolatedAsyncioTestCase):
             return resp.status
 
     async def test_control_file_is_private(self):
-        self.assertEqual(os.stat(app.CONTROL_FILE).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(control_page.CONTROL_FILE).st_mode & 0o777, 0o600)
 
     async def test_needs_token_and_local_host(self):
         self.assertEqual(await self.status_of(self.url), 200)
@@ -305,8 +314,8 @@ class ControlPageTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.status_of(self.url, headers={"Host": "evil.example"}), 403)
 
     async def test_status_reports_state_and_stats(self):
-        app.camera_problem = "no driver"
-        async with self.session.get(f"{self.base}/status?t={app.TOKEN}") as resp:
+        camera.camera_problem = "no driver"
+        async with self.session.get(f"{self.base}/status?t={phone_server.TOKEN}") as resp:
             s = await resp.json()
         self.assertEqual(s["camera_problem"], "no driver")
         self.assertFalse(s["mic_connected"])
@@ -316,22 +325,22 @@ class ControlPageTest(unittest.IsolatedAsyncioTestCase):
     async def test_stop_needs_token_and_post(self):
         async with self.session.post(f"{self.base}/stop") as resp:
             self.assertEqual(resp.status, 403)
-        async with self.session.get(f"{self.base}/stop?t={app.TOKEN}") as resp:
+        async with self.session.get(f"{self.base}/stop?t={phone_server.TOKEN}") as resp:
             self.assertEqual(resp.status, 405)
-        with mock.patch.object(app.os, "kill") as kill, \
+        with mock.patch.object(os, "kill") as kill, \
                 contextlib.redirect_stdout(io.StringIO()):
-            async with self.session.post(f"{self.base}/stop?t={app.TOKEN}") as resp:
+            async with self.session.post(f"{self.base}/stop?t={phone_server.TOKEN}") as resp:
                 self.assertEqual(resp.status, 200)
             await asyncio.sleep(0.4)
-        kill.assert_called_once_with(os.getpid(), app.signal.SIGINT)
+        kill.assert_called_once_with(os.getpid(), signal.SIGINT)
 
     async def test_running_copy_url(self):
-        self.assertEqual(await asyncio.to_thread(app.running_copy_url), self.url)
+        self.assertEqual(await asyncio.to_thread(control_page.running_copy_url), self.url)
         await self.stop(None)                     # removes the control file
-        self.assertIsNone(await asyncio.to_thread(app.running_copy_url))
-        with open(app.CONTROL_FILE, "w") as f:    # left over from a crash
+        self.assertIsNone(await asyncio.to_thread(control_page.running_copy_url))
+        with open(control_page.CONTROL_FILE, "w") as f:    # left over from a crash
             f.write(self.url)
-        self.assertIsNone(await asyncio.to_thread(app.running_copy_url))
+        self.assertIsNone(await asyncio.to_thread(control_page.running_copy_url))
 
 
 class CameraDiagnosisTest(unittest.TestCase):
@@ -346,11 +355,11 @@ class CameraDiagnosisTest(unittest.TestCase):
             out = sb_state if "--sb-state" in cmd else test_key
             return types.SimpleNamespace(stdout=out, stderr="")
 
-        with mock.patch.object(app.shutil, "which", which), \
-                mock.patch.object(app.os.path, "isdir", isdir), \
-                mock.patch.object(app.os.path, "exists", return_value=True), \
-                mock.patch.object(app.subprocess, "run", run):
-            return app.diagnose_camera()
+        with mock.patch.object(shutil, "which", which), \
+                mock.patch.object(os.path, "isdir", isdir), \
+                mock.patch.object(os.path, "exists", return_value=True), \
+                mock.patch.object(subprocess, "run", run):
+            return camera.diagnose_camera()
 
     def test_ffmpeg_missing(self):
         self.assertIn("ffmpeg isn't installed", self.run_with(ffmpeg=False))
@@ -360,7 +369,7 @@ class CameraDiagnosisTest(unittest.TestCase):
 
     def test_secure_boot_blocks(self):
         msg = self.run_with(sb_state="SecureBoot enabled",
-                            test_key=f"{app.MOK_KEY} is not enrolled")
+                            test_key=f"{camera.MOK_KEY} is not enrolled")
         self.assertIn("Secure Boot is blocking", msg)
         self.assertIn("mokutil --import", msg)
 
@@ -372,13 +381,13 @@ class CameraDiagnosisTest(unittest.TestCase):
 
 class MicInUseTest(unittest.IsolatedAsyncioTestCase):
     async def check(self, outputs):
-        sources = [{"index": 7, "name": app.SOURCE}, {"index": 3, "name": "other"}]
+        sources = [{"index": 7, "name": audio.SOURCE}, {"index": 3, "name": "other"}]
 
         async def fake(*args):
             return sources if "sources" in args else outputs
 
-        with mock.patch.object(app, "pactl_json", fake):
-            return await app.mic_in_use()
+        with mock.patch.object(audio, "pactl_json", fake):
+            return await audio.mic_in_use()
 
     async def test_counts_only_active_recordings_of_phone_mic(self):
         self.assertFalse(await self.check([]))
@@ -397,23 +406,23 @@ class VirtualMicTest(unittest.TestCase):
             if args[0] == "get-default-source":
                 return state["default"]
             if args[0] == "load-module":
-                state["default"] = app.SOURCE          # PulseAudio switches by itself
+                state["default"] = audio.SOURCE          # PulseAudio switches by itself
                 return "42"
             return ""
 
-        with mock.patch.object(app, "pactl", fake_pactl), \
-                mock.patch.object(app, "unload_stale_modules"), \
-                mock.patch.object(app.os.path, "exists", return_value=True):
-            self.assertEqual(app.create_virtual_mic(), ("42", "real_mic"))
+        with mock.patch.object(audio, "pactl", fake_pactl), \
+                mock.patch.object(audio, "unload_stale_modules"), \
+                mock.patch.object(os.path, "exists", return_value=True):
+            self.assertEqual(audio.create_virtual_mic(), ("42", "real_mic"))
 
 
 class MeterTest(unittest.TestCase):
     def test_rates(self):
-        with mock.patch.object(app.time, "monotonic", return_value=100.0):
-            m = app.Meter()
+        with mock.patch.object(time, "monotonic", return_value=100.0):
+            m = stats.Meter()
         for _ in range(30):
             m.add(1000)
-        with mock.patch.object(app.time, "monotonic", return_value=102.0):
+        with mock.patch.object(time, "monotonic", return_value=102.0):
             m.tick()
         self.assertEqual(m.per_sec, 15)
         self.assertEqual(m.bytes_per_sec, 15000)
@@ -421,7 +430,7 @@ class MeterTest(unittest.TestCase):
 
 class VirtualCamTest(unittest.TestCase):
     def test_counts_frames_replaced_before_ffmpeg_took_them(self):
-        cam = app.VirtualCam.__new__(app.VirtualCam)     # without its ffmpeg thread
+        cam = camera.VirtualCam.__new__(camera.VirtualCam)     # without its ffmpeg thread
         cam.frame, cam.skipped, cam.cond = None, 0, threading.Condition()
         cam.push(b"1")
         cam.push(b"2")
@@ -429,14 +438,14 @@ class VirtualCamTest(unittest.TestCase):
         self.assertEqual((cam.frame, cam.skipped), (b"3", 2))
 
     def spawn_command(self):
-        with mock.patch.object(app.subprocess, "Popen") as popen:
-            app.VirtualCam._spawn(types.SimpleNamespace(device="/dev/video10"))
+        with mock.patch.object(subprocess, "Popen") as popen:
+            camera.VirtualCam._spawn(types.SimpleNamespace(device="/dev/video10"))
         return popen.call_args.args[0]
 
     def test_ffmpeg_passes_frames_through_when_not_probing(self):
         # Regression: with -probesize 32 ffmpeg guesses 1200k fps and drops
         # almost every frame unless frame timing is passed through.
-        with mock.patch.object(app, "ffmpeg_passthrough_args",
+        with mock.patch.object(camera, "ffmpeg_passthrough_args",
                                return_value=("-vsync", "passthrough")):
             cmd = self.spawn_command()
         self.assertIn("-probesize", cmd)
@@ -452,18 +461,18 @@ class VirtualCamTest(unittest.TestCase):
             "-vsync  video sync method\n-r rate  set frame rate\n": "-vsync",
         }
         for help_text, expected in helps.items():
-            app.ffmpeg_passthrough_args.cache_clear()
-            with mock.patch.object(app.subprocess, "run",
+            camera.ffmpeg_passthrough_args.cache_clear()
+            with mock.patch.object(subprocess, "run",
                                    return_value=types.SimpleNamespace(stdout=help_text)):
-                self.assertEqual(app.ffmpeg_passthrough_args(), (expected, "passthrough"))
-        app.ffmpeg_passthrough_args.cache_clear()
+                self.assertEqual(camera.ffmpeg_passthrough_args(), (expected, "passthrough"))
+        camera.ffmpeg_passthrough_args.cache_clear()
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
     def test_real_ffmpeg_keeps_frames_with_our_options(self):
         # Runs the app's camera options through this system's ffmpeg: catches
         # options it doesn't know and the dropped-frames problem.
-        app.ffmpeg_passthrough_args.cache_clear()
-        app.ffmpeg_passthrough_args()          # real detection, before Popen is mocked
+        camera.ffmpeg_passthrough_args.cache_clear()
+        camera.ffmpeg_passthrough_args()          # real detection, before Popen is mocked
         jpeg = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
              "-i", "testsrc=size=320x240", "-frames:v", "1", "-f", "mjpeg", "-"],
@@ -479,16 +488,16 @@ class VirtualCamTest(unittest.TestCase):
 class PageScriptTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "node not installed")
     def test_page_javascript_parses(self):
-        pages = {"phone": app.PAGE, "control": app.CONTROL_PAGE.replace("{{TOKEN}}", '"x"')}
-        for name, page in pages.items():
-            script = re.search(r"<script>(.*)</script>", page, re.S).group(1)
-            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
-                f.write(script)
-            try:
-                r = subprocess.run(["node", "--check", f.name], capture_output=True, text=True)
-                self.assertEqual(r.returncode, 0, f"{name} page: {r.stderr}")
-            finally:
-                os.remove(f.name)
+        for name in ("phone.js", "control.js"):
+            r = subprocess.run(["node", "--check", os.path.join(WEB, name)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
+
+    def test_pages_are_served_with_their_scripts_inlined(self):
+        for name in ("phone", "control"):
+            page = phone_server.load_page(name)
+            self.assertNotIn("{{SCRIPT}}", page)
+            self.assertIn(read_web(f"{name}.js").strip(), page)
 
 
 @unittest.skipUnless(shutil.which("node"), "node not installed")
@@ -522,7 +531,8 @@ console.log('ok');
 """
 
     def test_one_connection_at_a_time(self):
-        connect = re.search(r"let reconnect;\nfunction connect\(\) \{.*?\n\}\n", app.PAGE, re.S)
+        connect = re.search(r"let reconnect;\nfunction connect\(\) \{.*?\n\}\n",
+                            read_web("phone.js"), re.S)
         self.assertIsNotNone(connect, "connect() not found in the phone page")
         with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
             f.write(self.HARNESS % connect.group(0))
@@ -534,11 +544,12 @@ console.log('ok');
 
     def test_stop_cancels_pending_reconnects(self):
         for name, timer in (("stop", "reconnect"), ("stopCam", "camReconnect")):
-            body = re.search(rf"function {name}\(\) \{{(.*?)\n\}}", app.PAGE, re.S).group(1)
+            body = re.search(rf"function {name}\(\) \{{(.*?)\n\}}", read_web("phone.js"),
+                             re.S).group(1)
             self.assertIn(f"clearTimeout({timer})", body, f"{name}() must cancel {timer}")
 
     def test_no_terminal_mentioned_to_phone_users(self):
-        self.assertNotIn("terminal", app.PAGE)
+        self.assertNotIn("terminal", phone_server.PAGE)
 
 
 class PackageTest(unittest.TestCase):
@@ -546,19 +557,24 @@ class PackageTest(unittest.TestCase):
     def test_build_deb(self):
         subprocess.run(["sh", "packaging/build-deb.sh"], cwd=ROOT, check=True,
                        capture_output=True)
-        deb = os.path.join(ROOT, "dist", f"phone-mic-cam_{app.__version__}_all.deb")
+        deb = os.path.join(ROOT, "dist", f"phone-mic-cam_{phone_mic_cam.__version__}_all.deb")
         info = subprocess.run(["dpkg-deb", "-I", deb], capture_output=True, text=True,
                               check=True).stdout
-        self.assertIn(f"Version: {app.__version__}", info)
+        self.assertIn(f"Version: {phone_mic_cam.__version__}", info)
         for dep in ("python3-aiohttp", "python3-qrcode", "ffmpeg", "v4l2loopback-dkms"):
             self.assertIn(dep, info)
         files = subprocess.run(["dpkg-deb", "-c", deb], capture_output=True, text=True,
                                check=True).stdout
-        for path in ("./usr/bin/phone-mic-cam", "./usr/share/phone-mic-cam/phone_mic_cam.py",
+        for path in ("./usr/bin/phone-mic-cam",
+                     "./usr/share/phone-mic-cam/phone_mic_cam/__main__.py",
+                     "./usr/share/phone-mic-cam/phone_mic_cam/app.py",
+                     "./usr/share/phone-mic-cam/phone_mic_cam/web/phone.js",
+                     "./usr/share/phone-mic-cam/phone_mic_cam/web/control.html",
                      "./usr/share/applications/phone-mic-cam.desktop",
                      "./usr/lib/modprobe.d/phone-mic-cam.conf"):
             self.assertIn(path, files)
         self.assertRegex(files, r"-rwxr-xr-x root/root .* \./usr/bin/phone-mic-cam")
+        self.assertNotIn("__pycache__", files)
 
 
 if __name__ == "__main__":

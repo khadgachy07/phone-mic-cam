@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Phone Mic Cam</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;
+       justify-content:center;gap:24px;font-family:-apple-system,system-ui,sans-serif;
+       background:#111;color:#eee}
+  button{border:none;font-weight:600;background:#2a7;color:#fff}
+  button.on{background:#c33}
+  #btn{width:200px;height:200px;border-radius:50%;font-size:22px}
+  .row{display:flex;gap:12px}
+  .row button{padding:14px 22px;border-radius:12px;font-size:17px}
+  #flip{background:#555}
+  #preview{width:240px;max-height:240px;border-radius:12px;background:#000;display:none}
+  #preview.mirror{transform:scaleX(-1)}
+  .status{font-size:17px;opacity:.8;text-align:center;padding:0 16px}
+  #bar{width:220px;height:10px;background:#333;border-radius:5px;overflow:hidden}
+  #lvl{height:100%;width:0;background:#2c8;transition:width .05s}
+</style></head><body>
+<button id="btn">Start mic</button>
+<div id="bar"><div id="lvl"></div></div>
+<div id="status" class="status">Tap to start. Keep this page open.</div>
+<video id="preview" playsinline muted autoplay></video>
+<div class="row"><button id="cambtn">Start camera</button><button id="flip">Flip</button></div>
+<div id="camstatus" class="status"></div>
+<script>
+{{SCRIPT}}
+</script></body></html>

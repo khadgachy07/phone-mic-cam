@@ -5,15 +5,17 @@ set -eu
 
 cd "$(dirname "$0")/.."
 pkg=phone-mic-cam
-version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' phone_mic_cam.py)
-[ -n "$version" ] || { echo "can't find __version__ in phone_mic_cam.py" >&2; exit 1; }
+version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' phone_mic_cam/__init__.py)
+[ -n "$version" ] || { echo "can't find __version__ in phone_mic_cam/__init__.py" >&2; exit 1; }
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 root="$stage/root"
 
 install -D -m 755 packaging/phone-mic-cam          "$root/usr/bin/phone-mic-cam"
-install -D -m 644 phone_mic_cam.py                 "$root/usr/share/$pkg/phone_mic_cam.py"
+for f in phone_mic_cam/*.py phone_mic_cam/web/*; do     # never __pycache__
+    install -D -m 644 "$f"                         "$root/usr/share/$pkg/$f"
+done
 install -D -m 644 packaging/phone-mic-cam.desktop  "$root/usr/share/applications/$pkg.desktop"
 install -D -m 644 packaging/phone-mic-cam.svg      "$root/usr/share/icons/hicolor/scalable/apps/$pkg.svg"
 install -D -m 644 packaging/modprobe.conf          "$root/usr/lib/modprobe.d/$pkg.conf"

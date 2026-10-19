@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Phone Mic Cam</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;
+       justify-content:center;gap:20px;padding:24px 16px;box-sizing:border-box;
+       font-family:system-ui,sans-serif;background:#111;color:#eee}
+  h1{margin:0;font-size:26px}
+  #qr{background:#fff;padding:16px;border-radius:12px;width:260px;height:260px}
+  #qr svg{width:100%;height:100%}
+  ol{font-size:16px;line-height:1.6;max-width:440px;margin:0;padding-left:22px}
+  #status{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:16px;
+          background:#1c1c1c;border-radius:12px;padding:14px 18px;min-width:280px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#555;
+       margin-right:8px}
+  .on .dot{background:#2c8}  .live .dot{background:#e44}
+  .stats{grid-column:2;font-size:13px;opacity:.65;margin-top:-4px;
+         font-variant-numeric:tabular-nums}
+  .stats:empty{display:none}
+  #camfix{max-width:440px;font-size:14px;line-height:1.5;background:#3a2a10;color:#fc6;
+          border-radius:10px;padding:12px 14px;display:none;word-break:break-word}
+  button{border:none;border-radius:12px;padding:12px 28px;font-size:16px;font-weight:600;
+         background:#c33;color:#fff;cursor:pointer}
+  button:disabled{background:#444;cursor:default}
+  code{font-size:12px;opacity:.6;word-break:break-all;max-width:440px;text-align:center}
+</style></head><body>
+<h1>Phone Mic Cam</h1>
+<div id="qr">{{QR}}</div>
+<ol>
+  <li>Connect your phone to the same Wi-Fi as this computer.</li>
+  <li>Point the phone's camera at the QR code and open the link.</li>
+  <li>Accept the certificate warning (Show Details &rarr; visit this website).</li>
+  <li>Tap <b>Start mic</b> and/or <b>Start camera</b>, and allow access.</li>
+</ol>
+<div id="status">
+  <span>Microphone</span><span id="mic"><span class="dot"></span>…</span>
+  <span id="micstats" class="stats"></span>
+  <span>Camera</span><span id="cam"><span class="dot"></span>…</span>
+  <span id="camstats" class="stats"></span>
+</div>
+<div id="camfix"></div>
+<button id="stop">Stop Phone Mic Cam</button>
+<code>{{URL}}</code>
+<script>
+{{SCRIPT}}
+</script>
+</body></html>
