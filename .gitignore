@@ -1,0 +1,5 @@
+# Private key and certificate are generated per install; never commit them.
+*.pem
+
+.venv/
+__pycache__/
