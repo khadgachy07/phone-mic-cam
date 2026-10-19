@@ -1,0 +1,9 @@
+#!/bin/sh
+# Launcher installed as /usr/bin/phone-mic-cam.
+# Started from the app grid there's no terminal, so keep the last run's
+# output in a log file for troubleshooting.
+if [ ! -t 1 ]; then
+    log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/phone-mic-cam"
+    mkdir -p "$log_dir" && exec >"$log_dir/last-run.log" 2>&1
+fi
+exec python3 -u /usr/share/phone-mic-cam/phone_mic_cam.py "$@"

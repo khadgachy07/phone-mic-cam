@@ -3,20 +3,20 @@
 Phone Mic Cam: use your phone as this Linux computer's microphone and webcam,
 with no app on the phone.
 
-  1. pip install -r requirements.txt     (needs openssl on the PATH)
-  2. python3 phone_mic_cam.py
-  3. Scan the QR code it shows (terminal and browser) with the phone on the
-     same Wi-Fi, accept the certificate warning, tap "Start mic" and/or
-     "Start camera". The link contains a secret code that changes every run.
+Installed from the .deb package, start it from the app grid ("Phone Mic Cam")
+or run `phone-mic-cam`. From source: pip install -r requirements.txt, then
+python3 phone_mic_cam.py.
+
+It opens a control page in this computer's browser with a QR code. Scan it
+with the phone on the same Wi-Fi, accept the certificate warning, and tap
+"Start mic" and/or "Start camera". The link contains a secret code that
+changes every run.
 
 While it runs, the computer has a microphone called "Phone Mic" set as the
-default input, so every app (browser, YouTube, Claude, Discord...) uses it.
-Ctrl+C restores your previous microphone.
-
-Optional camera ("Phone Cam" webcam), one-time setup:
-  sudo apt install ffmpeg v4l2loopback-dkms
-  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Phone Cam" exclusive_caps=1
-Without it the script runs mic-only.
+default input, so every app (browser, YouTube, Claude, Discord...) uses it,
+and, when the v4l2loopback driver is loaded, a webcam called "Phone Cam".
+Stop it with the control page's Stop button or Ctrl+C; your previous
+microphone is restored.
 
 SPDX-License-Identifier: MIT
 """
@@ -29,10 +29,12 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -42,7 +44,10 @@ try:
     import qrcode
     import qrcode.image.svg
 except ImportError as e:
-    sys.exit(f"Missing Python package '{e.name}'. Install with:  pip install -r requirements.txt")
+    sys.exit(f"Missing Python package '{e.name}'. Install with:  "
+             "sudo apt install python3-aiohttp python3-qrcode  (or pip install -r requirements.txt)")
+
+__version__ = "0.2.0"
 
 RATE = 48000                      # samples/sec, mono, signed 16-bit
 CHUNK_MS = 10
@@ -54,10 +59,16 @@ PORT = 8443
 FIFO = "/tmp/phone_mic_cam.fifo"
 SOURCE = "phone_mic"
 MIC_LABEL = "Phone Mic"
-HERE = os.path.dirname(os.path.abspath(__file__))
-CERT = os.path.join(HERE, "cert.pem")
-KEY = os.path.join(HERE, "key.pem")
+# Per-user files: the installed script lives in read-only /usr/share.
+DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                        "phone-mic-cam")
+CERT = os.path.join(DATA_DIR, "cert.pem")
+KEY = os.path.join(DATA_DIR, "key.pem")
+# URL of the running copy's control page, so a second launch can reopen it.
+CONTROL_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
+                            "phone-mic-cam.url")
 CAM_LABEL = "Phone Cam"           # must match v4l2loopback card_label
+MOK_KEY = "/var/lib/shim-signed/mok/MOK.der"   # Ubuntu's DKMS module-signing key
 CAM_FPS = 30
 MAX_FRAME = 1 << 21               # 2 MB per JPEG frame
 TOKEN = secrets.token_urlsafe(16) # pairing code; only the QR link carries it
@@ -66,9 +77,12 @@ buf = bytearray()
 buf_lock = threading.Lock()
 stop_event = threading.Event()
 cam = None                        # VirtualCam, or None when unavailable
+camera_problem = None             # why the camera is unavailable, with the fix
 clients = set()                   # open phone WebSockets, closed on shutdown
 mic_clients = set()               # the subset streaming the mic
+cam_clients = set()               # the subset streaming the camera
 mic_wanted = True                 # an app is recording; stays True if we can't tell
+mic_always_on = False             # --mic-always-on
 MIC_OFF_DELAY = 3                 # seconds without a recording app before mic off
 
 
@@ -205,16 +219,40 @@ class VirtualCam:
                 self.proc.kill()
 
 
-def setup_camera():
+def secure_boot_blocks_driver():
+    """True when Secure Boot is on and the key DKMS signs drivers with isn't enrolled."""
+    if not (shutil.which("mokutil") and os.path.exists(MOK_KEY)):
+        return False
+    state = subprocess.run(["mokutil", "--sb-state"], capture_output=True, text=True)
+    if "SecureBoot enabled" not in state.stdout:
+        return False
+    test = subprocess.run(["mokutil", "--test-key", MOK_KEY], capture_output=True, text=True)
+    return "is not enrolled" in test.stdout + test.stderr
+
+
+def diagnose_camera():
+    """Explain why there's no Phone Cam device, and how to fix it."""
     if not shutil.which("ffmpeg"):
-        print("  Camera disabled: ffmpeg not installed (sudo apt install ffmpeg).")
-        return None
-    device = find_loopback_device()
+        return "ffmpeg isn't installed. Install it with:  sudo apt install ffmpeg"
+    if os.path.isdir("/sys/module/v4l2loopback"):
+        return (f"The webcam driver is loaded, but not as '{CAM_LABEL}' (another app may "
+                "have loaded it). Restart your computer to apply Phone Mic Cam's settings.")
+    if secure_boot_blocks_driver():
+        return ("Secure Boot is blocking the webcam driver. Run  "
+                f"sudo mokutil --import {MOK_KEY}  and choose a one-time password, then "
+                "restart. On the blue screen choose Enroll MOK, Continue, Yes, and enter "
+                "that password.")
+    return ("The webcam driver isn't loaded. Restart your computer, or run:  "
+            "sudo modprobe v4l2loopback devices=1 video_nr=10 "
+            f"card_label=\"{CAM_LABEL}\" exclusive_caps=1")
+
+
+def setup_camera():
+    global camera_problem
+    device = find_loopback_device() if shutil.which("ffmpeg") else None
     if device is None:
-        print(f"  Camera disabled: no v4l2loopback device named '{CAM_LABEL}'. Run:")
-        print("    sudo apt install v4l2loopback-dkms")
-        print(f"    sudo modprobe v4l2loopback devices=1 video_nr=10 "
-              f"card_label=\"{CAM_LABEL}\" exclusive_caps=1")
+        camera_problem = diagnose_camera()
+        print(f"  Camera disabled: {camera_problem}")
         return None
     print(f"  '{CAM_LABEL}' webcam available at {device}.")
     return VirtualCam(device)
@@ -414,20 +452,32 @@ flipBtn.onclick = async () => {
 </script></body></html>"""
 
 
-DESKTOP_PAGE = """<!doctype html>
+CONTROL_PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Phone Mic &amp; Camera</title>
+<title>Phone Mic Cam</title>
 <style>
   body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;
-       justify-content:center;gap:20px;font-family:system-ui,sans-serif;background:#111;color:#eee}
-  #qr{background:#fff;padding:16px;border-radius:12px;width:280px;height:280px}
+       justify-content:center;gap:20px;padding:24px 16px;box-sizing:border-box;
+       font-family:system-ui,sans-serif;background:#111;color:#eee}
+  h1{margin:0;font-size:26px}
+  #qr{background:#fff;padding:16px;border-radius:12px;width:260px;height:260px}
   #qr svg{width:100%;height:100%}
-  ol{font-size:17px;line-height:1.6;max-width:420px}
-  code{font-size:13px;opacity:.7;word-break:break-all;max-width:420px;text-align:center}
+  ol{font-size:16px;line-height:1.6;max-width:440px;margin:0;padding-left:22px}
+  #status{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;font-size:16px;
+          background:#1c1c1c;border-radius:12px;padding:14px 18px;min-width:280px}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#555;
+       margin-right:8px}
+  .on .dot{background:#2c8}  .live .dot{background:#e44}
+  #camfix{max-width:440px;font-size:14px;line-height:1.5;background:#3a2a10;color:#fc6;
+          border-radius:10px;padding:12px 14px;display:none;word-break:break-word}
+  button{border:none;border-radius:12px;padding:12px 28px;font-size:16px;font-weight:600;
+         background:#c33;color:#fff;cursor:pointer}
+  button:disabled{background:#444;cursor:default}
+  code{font-size:12px;opacity:.6;word-break:break-all;max-width:440px;text-align:center}
 </style></head><body>
-<h1>Scan with your phone</h1>
+<h1>Phone Mic Cam</h1>
 <div id="qr">{{QR}}</div>
 <ol>
   <li>Connect your phone to the same Wi-Fi as this computer.</li>
@@ -435,7 +485,54 @@ DESKTOP_PAGE = """<!doctype html>
   <li>Accept the certificate warning (Show Details &rarr; visit this website).</li>
   <li>Tap <b>Start mic</b> and/or <b>Start camera</b>, and allow access.</li>
 </ol>
+<div id="status">
+  <span>Microphone</span><span id="mic"><span class="dot"></span>…</span>
+  <span>Camera</span><span id="cam"><span class="dot"></span>…</span>
+</div>
+<div id="camfix"></div>
+<button id="stop">Stop Phone Mic Cam</button>
 <code>{{URL}}</code>
+<script>
+const TOKEN = {{TOKEN}};
+const show = (id, text, cls) => {
+  const el = document.getElementById(id);
+  el.className = cls || '';
+  el.innerHTML = '<span class="dot"></span>';
+  el.append(text);
+};
+let stopped = false;
+async function refresh() {
+  if (stopped) return;
+  let s;
+  try {
+    s = await (await fetch('/status?t=' + TOKEN, {cache: 'no-store'})).json();
+  } catch (e) {
+    show('mic', 'Phone Mic Cam is not running'); show('cam', '—');
+    document.getElementById('stop').disabled = true;
+    return;
+  }
+  if (!s.mic_connected) show('mic', 'Waiting for your phone');
+  else if (s.mic_always_on) show('mic', 'Live (always on)', 'live');
+  else if (s.mic_live) show('mic', 'Live: an app is using it', 'live');
+  else show('mic', 'Ready: turns on when an app uses it', 'on');
+  if (s.camera_problem) show('cam', 'Not available');
+  else if (s.cam_connected) show('cam', 'Live as "Phone Cam"', 'live');
+  else show('cam', 'Ready: tap Start camera on your phone', 'on');
+  const fix = document.getElementById('camfix');
+  fix.textContent = s.camera_problem || '';
+  fix.style.display = s.camera_problem ? 'block' : 'none';
+}
+document.getElementById('stop').onclick = async () => {
+  const btn = document.getElementById('stop');
+  btn.disabled = true; btn.textContent = 'Stopping…';
+  try { await fetch('/stop?t=' + TOKEN, {method: 'POST'}); } catch (e) {}
+  stopped = true;
+  btn.textContent = 'Stopped';
+  show('mic', 'Stopped. Your previous microphone is back.'); show('cam', 'Stopped');
+  document.getElementById('camfix').style.display = 'none';
+};
+refresh(); setInterval(refresh, 1000);
+</script>
 </body></html>"""
 
 
@@ -478,6 +575,7 @@ async def video_handler(request):
         await ws.close(code=4000, message=b"no virtual camera")
         return ws
     clients.add(ws)
+    cam_clients.add(ws)
     print(f"Phone camera connected from {request.remote}")
     try:
         async for msg in ws:
@@ -485,6 +583,7 @@ async def video_handler(request):
                 cam.push(msg.data)
     finally:
         clients.discard(ws)
+        cam_clients.discard(ws)
     print("Phone camera disconnected")
     return ws
 
@@ -588,6 +687,7 @@ async def close_clients(app):
 def ensure_cert():
     if os.path.exists(CERT) and os.path.exists(KEY):
         return
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
     print("Creating a self-signed HTTPS certificate (Safari needs HTTPS for the mic)...")
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -623,48 +723,122 @@ def print_qr(url):
     qr.print_ascii(invert=True)
 
 
-def desktop_page_hooks(phone_url, open_browser):
-    """Serve the QR code to this computer's browser (localhost only, plain HTTP)."""
+def control_page_hooks(phone_url, open_browser):
+    """Serve the control page (QR code, status, Stop) to this computer's browser.
+
+    Localhost only, plain HTTP. Every request needs the pairing token and the
+    exact 127.0.0.1 Host, so other websites open in the browser can't read the
+    page or press Stop (CSRF, DNS rebinding).
+    """
     runner = None
+    host = None                      # "127.0.0.1:<port>", known once listening
     svg = qrcode.make(phone_url, image_factory=qrcode.image.svg.SvgPathImage)
-    page = (DESKTOP_PAGE.replace("{{QR}}", svg.to_string(encoding="unicode"))
-            .replace("{{URL}}", html.escape(phone_url)))
+    page = (CONTROL_PAGE.replace("{{QR}}", svg.to_string(encoding="unicode"))
+            .replace("{{URL}}", html.escape(phone_url))
+            .replace("{{TOKEN}}", json.dumps(TOKEN)))
+
+    @web.middleware
+    async def local_only(request, handler):
+        if request.host != host or not authorized(request):
+            raise web.HTTPForbidden()
+        return await handler(request)
 
     async def show(request):
         return web.Response(text=page, content_type="text/html")
 
+    async def status(request):
+        return web.json_response({
+            "mic_connected": bool(mic_clients),
+            "mic_live": mic_wanted,
+            "mic_always_on": mic_always_on,
+            "cam_connected": bool(cam_clients),
+            "camera_problem": camera_problem,
+        })
+
+    async def stop_app(request):
+        print("Stop pressed on the control page")
+        # Same path as Ctrl+C, after this response has been sent.
+        asyncio.get_running_loop().call_later(0.2, os.kill, os.getpid(), signal.SIGINT)
+        return web.json_response({"stopping": True})
+
     async def start(app):
-        nonlocal runner
-        desk = web.Application()
+        nonlocal runner, host
+        desk = web.Application(middlewares=[local_only])
         desk.router.add_get("/", show)
+        desk.router.add_get("/status", status)
+        desk.router.add_post("/stop", stop_app)
         runner = web.AppRunner(desk, shutdown_timeout=1)
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", 0).start()     # any free port
-        url = f"http://127.0.0.1:{runner.addresses[0][1]}/"
-        print(f"  QR code page on this computer: {url}\n")
+        host = f"127.0.0.1:{runner.addresses[0][1]}"
+        url = f"http://{host}/?t={TOKEN}"
+        fd = os.open(CONTROL_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(url)
+        print(f"  Control page on this computer: {url}\n")
         if open_browser:
             webbrowser.open(url)
 
     async def stop(app):
+        try:
+            os.remove(CONTROL_FILE)
+        except FileNotFoundError:
+            pass
         if runner:
             await runner.cleanup()
 
     return start, stop
 
 
+def running_copy_url():
+    """Control page URL of an already running Phone Mic Cam, or None."""
+    try:
+        with open(CONTROL_FILE) as f:
+            url = f.read().strip()
+        port = int(url.split("://", 1)[1].split("/", 1)[0].rsplit(":", 1)[1])
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+    except (OSError, ValueError, IndexError):
+        return None                  # no file, or left over from a crash
+    return url
+
+
+def fatal(message):
+    """Exit with an error the user can see, even when started from the app grid."""
+    print(message, file=sys.stderr)
+    if not sys.stderr.isatty() and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "--icon=phone-mic-cam", "Phone Mic Cam", message],
+                       check=False)
+    sys.exit(1)
+
+
 def main():
-    global cam
+    global cam, mic_always_on
     parser = argparse.ArgumentParser(description="Use your phone as this computer's mic and camera.")
     parser.add_argument("--no-browser", action="store_true",
-                        help="don't open the QR code page in this computer's browser")
+                        help="don't open the control page in this computer's browser")
     parser.add_argument("--mic-always-on", action="store_true",
                         help="stream the phone mic all the time, not only while an app records")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args()
+    mic_always_on = args.mic_always_on
     # Check before touching audio: a second copy would remove the first one's mic.
     if not port_free(PORT):
-        sys.exit(f"Port {PORT} is already in use. Is Phone Mic Cam already running?")
-    ensure_cert()
-    module_id, previous = create_virtual_mic()
+        url = running_copy_url()
+        if url is None:
+            fatal(f"Port {PORT} is already in use by another program, so Phone Mic Cam can't start.")
+        print(f"Phone Mic Cam is already running. Control page: {url}")
+        if not args.no_browser:
+            webbrowser.open(url)
+        return
+    for tool in ("pactl", "openssl"):
+        if not shutil.which(tool):
+            fatal(f"'{tool}' is missing. Install it with:  sudo apt install "
+                  f"{'pulseaudio-utils' if tool == 'pactl' else 'openssl'}")
+    try:
+        ensure_cert()
+        module_id, previous = create_virtual_mic()
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
+        fatal(f"Couldn't set up the microphone: {e}")
     t = threading.Thread(target=writer_thread, daemon=True)
     t.start()
     cam = setup_camera()
@@ -677,7 +851,7 @@ def main():
     sslctx.load_cert_chain(CERT, KEY)
 
     phone_url = f"https://{lan_ip()}:{PORT}/?t={TOKEN}"
-    start_desktop, stop_desktop = desktop_page_hooks(phone_url, not args.no_browser)
+    start_desktop, stop_desktop = control_page_hooks(phone_url, not args.no_browser)
     start_watch, stop_watch = mic_watch_hooks(not args.mic_always_on)
     app.on_startup.append(start_desktop)
     app.on_startup.append(start_watch)
@@ -689,7 +863,8 @@ def main():
     print("  Scan this QR code with your phone (same Wi-Fi):\n")
     print_qr(phone_url)
     print(f"\n  or open: {phone_url}")
-    print("  Accept the certificate warning, then tap Start mic / Start camera.  Ctrl+C to quit.")
+    print("  Accept the certificate warning, then tap Start mic / Start camera.")
+    print("  Stop with the control page's Stop button or Ctrl+C.")
     try:
         web.run_app(app, host="0.0.0.0", port=PORT, ssl_context=sslctx, print=None,
                     shutdown_timeout=5)

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Load the "Phone Cam" webcam driver now, so the camera works without a
+# restart. Never fail the install over it: the microphone works without it.
+set -e
+
+if [ "$1" = configure ]; then
+    if [ -d /sys/module/v4l2loopback ]; then
+        if ! grep -qx "Phone Cam" /sys/class/video4linux/video*/name 2>/dev/null; then
+            echo "Phone Mic Cam: the webcam driver is already loaded with other settings."
+            echo "Phone Mic Cam: restart your computer to use the camera."
+        fi
+    elif modprobe v4l2loopback 2>/dev/null; then
+        echo "Phone Mic Cam: webcam driver loaded."
+    else
+        echo "Phone Mic Cam: couldn't load the webcam driver yet; restart your computer."
+        echo "Phone Mic Cam: if Secure Boot blocks it, the app shows how to allow it."
+    fi
+fi
+
+exit 0

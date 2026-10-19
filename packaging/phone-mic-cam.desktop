@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Phone Mic Cam
+GenericName=Phone Microphone and Webcam
+Comment=Use your phone as this computer's microphone and webcam
+Exec=phone-mic-cam
+Icon=phone-mic-cam
+Terminal=false
+Categories=AudioVideo;Audio;Video;
+Keywords=microphone;mic;webcam;camera;phone;iphone;android;
+StartupNotify=false
