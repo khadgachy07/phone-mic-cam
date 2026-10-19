@@ -72,11 +72,15 @@ class PairingTest(unittest.TestCase):
 class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         reset_state()
+        # Never use a real webcam device, even on a machine that has Phone Cam.
+        self.no_device = mock.patch.object(app, "find_loopback_device", return_value=None)
+        self.no_device.start()
         self.client = TestClient(TestServer(phone_app()))
         await self.client.start_server()
 
     async def asyncTearDown(self):
         await self.client.close()
+        self.no_device.stop()
         reset_state()
 
     async def test_page_needs_token(self):
@@ -118,6 +122,35 @@ class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
         ws = await self.client.ws_connect(f"/video?t={app.TOKEN}")
         await ws.receive()
         self.assertEqual(ws.close_code, 4000)
+
+    async def test_camera_loaded_after_startup_is_picked_up(self):
+        # Regression: the camera was only set up at startup, so loading the
+        # driver as the control page suggests didn't help until a restart.
+        app.camera_problem = "The webcam driver isn't loaded."
+        self.no_device.stop()
+        with mock.patch.object(app, "find_loopback_device", return_value="/dev/video99"), \
+                mock.patch.object(app.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+                mock.patch.object(app, "VirtualCam", side_effect=lambda dev: FakeCam()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ws = await self.client.ws_connect(f"/video?t={app.TOKEN}")
+            await ws.send_bytes(b"\xff\xd8 frame")
+            for _ in range(50):
+                if app.cam and app.cam.frames:
+                    break
+                await asyncio.sleep(0.01)
+            await ws.close()
+        self.no_device.start()
+        self.assertEqual(app.cam.frames, [b"\xff\xd8 frame"])
+        self.assertIsNone(app.camera_problem)
+
+    async def test_starting_live_drops_audio_left_from_last_session(self):
+        # Regression: audio left in the buffer when the mic went to Ready was
+        # played at the start of the next recording.
+        app.mic_wanted = False
+        app.feed(bytes(9600))                      # 100 ms left over
+        with contextlib.redirect_stdout(io.StringIO()):
+            await app.set_mic_wanted(True)
+        self.assertEqual(app.mic_buffer_ms(), 0)
 
     async def test_video_forwards_only_jpeg(self):
         app.cam = FakeCam()
@@ -166,6 +199,66 @@ class ReportTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Phone camera refused: NotAllowedError: line1?FAKE log line?[31m", log)
         self.assertIn("(mic Ready, page visible)", log)
         self.assertNotIn("A" * 201, log)
+
+
+class LogFileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "state", "phone-mic-cam", "last-run.log")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_second_launch_leaves_running_copys_log_alone(self):
+        # Regression: opening the app again (to reopen the control page)
+        # wiped the running copy's log.
+        os.makedirs(os.path.dirname(self.log))
+        with open(self.log, "w") as f:
+            f.write("12:00:00 Phone camera refused: NotAllowedError\n")
+        with mock.patch.object(app, "port_free", return_value=False), \
+                mock.patch.object(app, "running_copy_url", return_value="http://127.0.0.1:1/?t=x"), \
+                mock.patch.object(app, "log_to_file") as log_to_file, \
+                contextlib.redirect_stdout(io.StringIO()):
+            app.main(["--log-file", self.log, "--no-browser"])
+        log_to_file.assert_not_called()
+        with open(self.log) as f:
+            self.assertIn("Phone camera refused", f.read())
+
+    def test_log_to_file_replaces_previous_run_and_catches_child_output(self):
+        os.makedirs(os.path.dirname(self.log))
+        with open(self.log, "w") as f:
+            f.write("previous run\n")
+        code = ("import os, sys; sys.path.insert(0, sys.argv[1]); import phone_mic_cam as a; "
+                "a.log_to_file(sys.argv[2]); print('from python'); "
+                "os.system('echo from a child process')")
+        subprocess.run([sys.executable, "-c", code, ROOT, self.log], check=True)
+        with open(self.log) as f:
+            text = f.read()
+        self.assertNotIn("previous run", text)
+        self.assertIn("from python", text)
+        self.assertIn("from a child process", text)
+        self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
+
+    def test_launcher_passes_log_file_without_touching_it(self):
+        fake_bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(fake_bin)
+        args_file = os.path.join(self.tmp.name, "args")
+        with open(os.path.join(fake_bin, "python3"), "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{args_file}"\n')
+        os.chmod(os.path.join(fake_bin, "python3"), 0o755)
+        os.makedirs(os.path.dirname(self.log))
+        with open(self.log, "w") as f:
+            f.write("running copy's log\n")
+        env = dict(os.environ, PATH=fake_bin + os.pathsep + os.environ["PATH"],
+                   XDG_STATE_HOME=os.path.join(self.tmp.name, "state"))
+        subprocess.run(["sh", os.path.join(ROOT, "packaging", "phone-mic-cam"), "--no-browser"],
+                       env=env, check=True, stdout=subprocess.PIPE)   # stdout is not a terminal
+        with open(args_file) as f:
+            args = f.read().split("\n")
+        self.assertEqual(args[:5], ["-u", "/usr/share/phone-mic-cam/phone_mic_cam.py",
+                                    "--log-file", self.log, "--no-browser"])
+        with open(self.log) as f:
+            self.assertEqual(f.read(), "running copy's log\n")
 
 
 class CleanTest(unittest.TestCase):
@@ -339,6 +432,56 @@ class PageScriptTest(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, f"{name} page: {r.stderr}")
             finally:
                 os.remove(f.name)
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class PhoneReconnectTest(unittest.TestCase):
+    """Runs the phone page's mic connect() in node with fake sockets and timers."""
+
+    HARNESS = r"""
+const sockets = []; let timers = [];
+class WebSocket { constructor(url) { this.url = url; sockets.push(this); } }
+const setTimeout = (fn, ms) => { timers.push(fn); return timers.length; };
+const clearTimeout = id => { if (id) timers[id - 1] = null; };
+const flush = () => { const t = timers; timers = []; t.forEach(fn => fn && fn()); };
+const location = {host: 'pc'}, TOKEN = 'x', RECONNECTING = 'reconnecting';
+let ws, running = true; const states = [];
+const setLive = on => states.push(on), say = () => {};
+%s
+const check = (label, cond) => { if (!cond) { console.log('FAIL: ' + label); process.exit(1); } };
+connect();                                   // socket 0
+sockets[0].onclose();                        // dropped: reconnect scheduled
+connect();                                   // a new connection while it's pending: socket 1
+flush();                                     // the pending reconnect must not fire
+check('pending reconnect is cancelled by a new connection', sockets.length === 2);
+sockets[0].onclose();                        // a late close of the old socket
+flush();
+check('old socket does not reconnect', sockets.length === 2);
+sockets[0].onmessage({data: 'on'});
+check('old socket does not change state', !states.includes(true));
+sockets[1].onmessage({data: 'on'});
+check('current socket changes state', states[states.length - 1] === true);
+console.log('ok');
+"""
+
+    def test_one_connection_at_a_time(self):
+        connect = re.search(r"let reconnect;\nfunction connect\(\) \{.*?\n\}\n", app.PAGE, re.S)
+        self.assertIsNotNone(connect, "connect() not found in the phone page")
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(self.HARNESS % connect.group(0))
+        try:
+            r = subprocess.run(["node", f.name], capture_output=True, text=True)
+        finally:
+            os.remove(f.name)
+        self.assertEqual(r.stdout.strip(), "ok", r.stdout + r.stderr)
+
+    def test_stop_cancels_pending_reconnects(self):
+        for name, timer in (("stop", "reconnect"), ("stopCam", "camReconnect")):
+            body = re.search(rf"function {name}\(\) \{{(.*?)\n\}}", app.PAGE, re.S).group(1)
+            self.assertIn(f"clearTimeout({timer})", body, f"{name}() must cancel {timer}")
+
+    def test_no_terminal_mentioned_to_phone_users(self):
+        self.assertNotIn("terminal", app.PAGE)
 
 
 class PackageTest(unittest.TestCase):

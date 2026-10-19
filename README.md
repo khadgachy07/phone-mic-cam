@@ -163,7 +163,9 @@ python3 -m venv .venv
 ```
 
 Options: `--no-browser` (don't open the control page), `--mic-always-on`,
-`--version`. When started from a terminal, Ctrl+C stops it too.
+`--log-file PATH` (write the output there; the installed launcher uses this
+when there's no terminal), `--version`. When started from a terminal, Ctrl+C
+stops it too.
 
 For the camera without the package, set up the webcam driver by hand:
 

@@ -47,7 +47,7 @@ except ImportError as e:
     sys.exit(f"Missing Python package '{e.name}'. Install with:  "
              "sudo apt install python3-aiohttp python3-qrcode  (or pip install -r requirements.txt)")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 RATE = 48000                      # samples/sec, mono, signed 16-bit
 CHUNK_MS = 10
@@ -274,6 +274,19 @@ def setup_camera():
     return VirtualCam(device)
 
 
+def try_enable_camera():
+    """Pick up Phone Cam if it appeared after startup, e.g. the driver was loaded
+    while the app runs as the control page suggests. Returns the camera or None."""
+    global cam, camera_problem
+    if cam is None and shutil.which("ffmpeg"):
+        device = find_loopback_device()
+        if device:
+            print(f"'{CAM_LABEL}' webcam is now available at {device}.")
+            cam = VirtualCam(device)
+            camera_problem = None
+    return cam
+
+
 # ---------------------------------------------------------------- web side
 PAGE = r"""<!doctype html>
 <html lang="en"><head>
@@ -345,13 +358,19 @@ function setLive(on) {
          : 'Ready: turns on when an app on your PC uses the mic');
 }
 
+// Only the current socket may change state or reconnect; a pending reconnect
+// is cancelled by Stop and Start, so a quick Stop+Start can't open two.
+let reconnect;
 function connect() {
-  ws = new WebSocket(`wss://${location.host}/ws?t=${TOKEN}`);
-  ws.binaryType = 'arraybuffer';
-  ws.onmessage = e => { if (typeof e.data === 'string') setLive(e.data === 'on'); };
-  ws.onclose = () => {
-    if (!running) return;
-    setLive(false); say(RECONNECTING); setTimeout(connect, 1000);
+  clearTimeout(reconnect);
+  const sock = ws = new WebSocket(`wss://${location.host}/ws?t=${TOKEN}`);
+  sock.binaryType = 'arraybuffer';
+  sock.onmessage = e => {
+    if (sock === ws && typeof e.data === 'string') setLive(e.data === 'on');
+  };
+  sock.onclose = () => {
+    if (!running || sock !== ws) return;
+    setLive(false); say(RECONNECTING); reconnect = setTimeout(connect, 1000);
   };
 }
 
@@ -381,6 +400,7 @@ async function start() {
 
 function stop() {
   running = false; live = false;
+  clearTimeout(reconnect);
   if (ws) ws.close();
   if (stream) stream.getTracks().forEach(t => t.stop());
   if (ctx) ctx.close();
@@ -433,12 +453,17 @@ let camStream, camWs, camTimer, camRunning = false, encoding = false, facing = '
 let loopId = 0;                   // bumped to end the current frame loop
 const camSay = t => camSt.textContent = t;
 
+let camReconnect;
 function camConnect() {
-  camWs = new WebSocket(`wss://${location.host}/video?t=${TOKEN}`);
-  camWs.onopen = () => camSay('Camera live: your PC is seeing you');
-  camWs.onclose = e => {
-    if (e.code === NO_CAMERA) { stopCam(); camSay('Your PC has no virtual camera set up (see its terminal).'); }
-    else if (camRunning) { camSay('Camera: ' + RECONNECTING); setTimeout(camConnect, 1000); }
+  clearTimeout(camReconnect);
+  const sock = camWs = new WebSocket(`wss://${location.host}/video?t=${TOKEN}`);
+  sock.onopen = () => { if (sock === camWs) camSay('Camera live: your PC is seeing you'); };
+  sock.onclose = e => {
+    if (sock !== camWs) return;
+    if (e.code === NO_CAMERA) {
+      stopCam(); camSay('Your PC has no virtual camera set up. The control page on your PC shows how to fix it.');
+    }
+    else if (camRunning) { camSay('Camera: ' + RECONNECTING); camReconnect = setTimeout(camConnect, 1000); }
   };
 }
 
@@ -492,6 +517,7 @@ async function startCam() {
 function stopCam() {
   camRunning = false;
   loopId++;
+  clearTimeout(camReconnect);
   clearInterval(camTimer);
   if (camWs) camWs.close();
   if (camStream) camStream.getTracks().forEach(t => t.stop());
@@ -649,7 +675,7 @@ async def video_handler(request):
         raise web.HTTPForbidden()
     ws = web.WebSocketResponse(max_msg_size=MAX_FRAME)
     await ws.prepare(request)
-    if cam is None:
+    if try_enable_camera() is None:
         await ws.close(code=4000, message=b"no virtual camera")
         return ws
     clients.add(ws)
@@ -715,6 +741,12 @@ async def set_mic_wanted(wanted: bool, quiet=False):
     if wanted == mic_wanted:
         return
     mic_wanted = wanted
+    if wanted:
+        # Audio left from the previous Live session waits in the buffer while
+        # no app records (the pipe into PulseAudio is full); drop it so the
+        # new recording starts with fresh audio.
+        with buf_lock:
+            buf.clear()
     if not quiet:
         print("An app is using the mic: phone mic on" if wanted else
               "No app is using the mic: phone mic off")
@@ -826,6 +858,7 @@ def stats_hooks():
             await asyncio.sleep(1)
             mic_meter.tick()
             cam_meter.tick()
+            try_enable_camera()      # so the control page notices a newly loaded driver
 
     async def start(app):
         nonlocal task
@@ -968,6 +1001,18 @@ def running_copy_url():
     return url
 
 
+def log_to_file(path):
+    """Send this run's output (ours and ffmpeg's) to a fresh log file."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)          # it contains the pairing link; an older log may be readable
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+
+
 def fatal(message):
     """Exit with an error the user can see, even when started from the app grid."""
     print(message, file=sys.stderr)
@@ -977,7 +1022,7 @@ def fatal(message):
     sys.exit(1)
 
 
-def main():
+def main(argv=None):
     global cam, mic_always_on
     parser = argparse.ArgumentParser(prog="phone-mic-cam",
                                      description="Use your phone as this computer's mic and camera.")
@@ -986,7 +1031,10 @@ def main():
     parser.add_argument("--mic-always-on", action="store_true",
                         help="stream the phone mic all the time, not only while an app records")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    args = parser.parse_args()
+    parser.add_argument("--log-file", metavar="PATH",
+                        help="write this run's output to PATH (the launcher passes this "
+                             "when there's no terminal)")
+    args = parser.parse_args(argv)
     mic_always_on = args.mic_always_on
     # Check before touching audio: a second copy would remove the first one's mic.
     if not port_free(PORT):
@@ -997,6 +1045,9 @@ def main():
         if not args.no_browser:
             webbrowser.open(url)
         return
+    # Only now, as the copy that starts, replace the previous run's log.
+    if args.log_file:
+        log_to_file(args.log_file)
     for tool in ("pactl", "openssl"):
         if not shutil.which(tool):
             fatal(f"'{tool}' is missing. Install it with:  sudo apt install "
