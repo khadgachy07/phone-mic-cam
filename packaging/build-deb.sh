@@ -29,7 +29,7 @@ Version: $version
 Architecture: all
 Maintainer: khadgachy07 <khadgachy07@gmail.com>
 Installed-Size: $installed_size
-Depends: python3 (>= 3.10), python3-aiohttp (>= 3.9), python3-qrcode (>= 8.0), pulseaudio-utils, openssl, ffmpeg, v4l2loopback-dkms
+Depends: python3 (>= 3.10), python3-aiohttp (>= 3.8), python3-qrcode (>= 7.3), pulseaudio-utils, openssl, ffmpeg, v4l2loopback-dkms
 Recommends: libnotify-bin, mokutil
 Section: sound
 Priority: optional

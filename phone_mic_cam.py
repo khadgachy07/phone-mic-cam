@@ -22,11 +22,13 @@ SPDX-License-Identifier: MIT
 """
 import argparse
 import asyncio
+import functools
 import glob
 import hmac
 import html
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -40,14 +42,15 @@ import time
 import webbrowser
 
 try:
-    from aiohttp import web, WSCloseCode, WSMsgType
+    from aiohttp import __version__ as aiohttp_version, web, WSCloseCode, WSMsgType
     import qrcode
     import qrcode.image.svg
 except ImportError as e:
     sys.exit(f"Missing Python package '{e.name}'. Install with:  "
              "sudo apt install python3-aiohttp python3-qrcode  (or pip install -r requirements.txt)")
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
+AIOHTTP_3_9 = tuple(int(p) for p in aiohttp_version.split(".")[:2]) >= (3, 9)
 
 RATE = 48000                      # samples/sec, mono, signed 16-bit
 CHUNK_MS = 10
@@ -104,6 +107,9 @@ def unload_stale_modules():
 
 def create_virtual_mic():
     unload_stale_modules()
+    # Ask before loading: PulseAudio may switch the default to a new source
+    # by itself, and then there'd be nothing to restore on exit.
+    previous = pactl("get-default-source", check=False) or None
     module_id = pactl(
         "load-module", "module-pipe-source",
         f"source_name={SOURCE}", f"file={FIFO}",
@@ -114,7 +120,6 @@ def create_virtual_mic():
         if os.path.exists(FIFO):
             break
         time.sleep(0.05)
-    previous = pactl("get-default-source", check=False) or None
     pactl("set-default-source", SOURCE)
     return module_id, previous
 
@@ -173,6 +178,17 @@ def find_loopback_device():
     return None
 
 
+@functools.lru_cache(maxsize=None)
+def ffmpeg_passthrough_args():
+    """ffmpeg 5.1+ calls it -fps_mode; older ones (Ubuntu 22.04 has 4.4) only know
+    -vsync, which newer ones deprecate."""
+    help_text = subprocess.run(["ffmpeg", "-hide_banner", "-h", "full"],
+                               capture_output=True, text=True).stdout
+    if re.search(r"^-fps_mode\b", help_text, re.M):
+        return ("-fps_mode", "passthrough")
+    return ("-vsync", "passthrough")
+
+
 class VirtualCam:
     """Feed JPEG frames from the phone into the loopback device via ffmpeg."""
 
@@ -201,7 +217,7 @@ class VirtualCam:
              # arrive instead of retiming them.
              "-fflags", "nobuffer", "-probesize", "32", "-analyzeduration", "0",
              "-f", "mjpeg", "-framerate", str(CAM_FPS),
-             "-i", "pipe:0", "-fps_mode", "passthrough",
+             "-i", "pipe:0", *ffmpeg_passthrough_args(),
              "-pix_fmt", "yuv420p", "-f", "v4l2", self.device],
             stdin=subprocess.PIPE,
         )
@@ -931,7 +947,8 @@ def control_page_hooks(phone_url, open_browser):
     runner = None
     host = None                      # "127.0.0.1:<port>", known once listening
     svg = qrcode.make(phone_url, image_factory=qrcode.image.svg.SvgPathImage)
-    page = (CONTROL_PAGE.replace("{{QR}}", svg.to_string(encoding="unicode"))
+    # to_string() without arguments: qrcode 7.3 (Ubuntu 22.04) has no encoding=.
+    page = (CONTROL_PAGE.replace("{{QR}}", svg.to_string().decode("utf-8"))
             .replace("{{URL}}", html.escape(phone_url))
             .replace("{{TOKEN}}", json.dumps(TOKEN)))
 
@@ -966,9 +983,13 @@ def control_page_hooks(phone_url, open_browser):
         desk.router.add_get("/", show)
         desk.router.add_get("/status", status)
         desk.router.add_post("/stop", stop_app)
-        runner = web.AppRunner(desk, shutdown_timeout=1)
+        # aiohttp 3.9 moved shutdown_timeout from the site to the runner;
+        # Ubuntu 22.04 has 3.8, where the runner passes it on and breaks requests.
+        quick = {"shutdown_timeout": 1}
+        runner = web.AppRunner(desk, **(quick if AIOHTTP_3_9 else {}))
         await runner.setup()
-        await web.TCPSite(runner, "127.0.0.1", 0).start()     # any free port
+        await web.TCPSite(runner, "127.0.0.1", 0,                # any free port
+                          **({} if AIOHTTP_3_9 else quick)).start()
         host = f"127.0.0.1:{runner.addresses[0][1]}"
         url = f"http://{host}/?t={TOKEN}"
         fd = os.open(CONTROL_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

@@ -12,10 +12,13 @@ While it runs, the computer gets:
 
 When you stop it, your previous default microphone is restored.
 
-> **Platform support:** the computer side runs on **Ubuntu and Debian-based
-> Linux** with PulseAudio or PipeWire. Windows and macOS aren't supported yet.
-> Testing so far has used an iPhone with Safari. Android with Chrome should
-> work, since it uses the same browser features, but hasn't been tested.
+> **Platform support:** the computer side runs on **Ubuntu 22.04 or newer and
+> Debian 12 or newer** (and distributions based on them), with PulseAudio or
+> PipeWire. Every change is tested on Ubuntu 22.04, 24.04 and 26.04 and on
+> Debian 12 and 13. Ubuntu 20.04 and older aren't supported. Windows and macOS
+> aren't supported yet. Testing so far has used an iPhone with Safari. Android
+> with Chrome should work, since it uses the same browser features, but hasn't
+> been tested.
 
 ## Install
 
@@ -143,7 +146,7 @@ create a webcam, which is why the driver is needed.
 
 ## Limitations
 
-- Ubuntu and Debian-based Linux only for now.
+- Ubuntu 22.04+ and Debian 12+ only for now.
 - iOS stops the mic and camera when Safari goes into the background or the
   screen locks.
 - Video is sent at 1280×720 landscape. A phone held upright appears with
@@ -220,10 +223,20 @@ python3 -m unittest discover -s tests -v
 
 The tests need only the app's own Python dependencies and use only
 `127.0.0.1`, without touching PulseAudio or the webcam driver. The page
-script check needs `node` and the package check needs `dpkg-deb`; each is
-skipped when its tool isn't installed. GitHub Actions runs the same tests on
-every push and pull request, and keeps the built `.deb` as a download on
-each run.
+script check needs `node`, the camera check needs `ffmpeg` and the package
+check needs `dpkg-deb`; each is skipped when its tool isn't installed.
+
+GitHub Actions runs the tests on every push and pull request in Docker
+containers of each supported system (Ubuntu 22.04, 24.04 and 26.04, Debian 12
+and 13), using that system's own packages, and checks that the built `.deb`
+installs there. It keeps the `.deb` as a download on each run. To repeat one
+system's run locally:
+
+```bash
+docker run --rm -it -v "$PWD":/src:ro ubuntu:22.04 bash
+# then, inside: apt-get update && apt-get install -y python3-aiohttp python3-qrcode ffmpeg nodejs dpkg-dev
+# cp -r /src /w && cd /w && python3 -m unittest discover -s tests -v
+```
 
 ## Contributing
 

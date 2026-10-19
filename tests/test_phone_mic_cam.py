@@ -387,6 +387,26 @@ class MicInUseTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.check([{"source": 3, "corked": False}]))
 
 
+class VirtualMicTest(unittest.TestCase):
+    def test_remembers_default_before_pulseaudio_switches_it(self):
+        # Regression: PulseAudio can make a new source the default by itself;
+        # asking afterwards gave "phone_mic", so the real mic wasn't restored.
+        state = {"default": "real_mic"}
+
+        def fake_pactl(*args, check=True):
+            if args[0] == "get-default-source":
+                return state["default"]
+            if args[0] == "load-module":
+                state["default"] = app.SOURCE          # PulseAudio switches by itself
+                return "42"
+            return ""
+
+        with mock.patch.object(app, "pactl", fake_pactl), \
+                mock.patch.object(app, "unload_stale_modules"), \
+                mock.patch.object(app.os.path, "exists", return_value=True):
+            self.assertEqual(app.create_virtual_mic(), ("42", "real_mic"))
+
+
 class MeterTest(unittest.TestCase):
     def test_rates(self):
         with mock.patch.object(app.time, "monotonic", return_value=100.0):
@@ -408,15 +428,52 @@ class VirtualCamTest(unittest.TestCase):
         cam.push(b"3")
         self.assertEqual((cam.frame, cam.skipped), (b"3", 2))
 
+    def spawn_command(self):
+        with mock.patch.object(app.subprocess, "Popen") as popen:
+            app.VirtualCam._spawn(types.SimpleNamespace(device="/dev/video10"))
+        return popen.call_args.args[0]
+
     def test_ffmpeg_passes_frames_through_when_not_probing(self):
         # Regression: with -probesize 32 ffmpeg guesses 1200k fps and drops
         # almost every frame unless frame timing is passed through.
-        with mock.patch.object(app.subprocess, "Popen") as popen:
-            app.VirtualCam._spawn(types.SimpleNamespace(device="/dev/video10"))
-        cmd = popen.call_args.args[0]
+        with mock.patch.object(app, "ffmpeg_passthrough_args",
+                               return_value=("-vsync", "passthrough")):
+            cmd = self.spawn_command()
         self.assertIn("-probesize", cmd)
-        i = cmd.index("-fps_mode")
+        i = cmd.index("-vsync")
         self.assertEqual(cmd[i + 1], "passthrough")
+
+    def test_passthrough_option_follows_ffmpeg_version(self):
+        helps = {
+            # ffmpeg 8: -vsync deprecated, mentions -fps_mode, which has its own line
+            "-vsync <>  set video sync method globally; deprecated, use -fps_mode\n"
+            "-fps_mode[:<stream_spec>]  set framerate mode\n": "-fps_mode",
+            # ffmpeg 4.4 (Ubuntu 22.04): no -fps_mode
+            "-vsync  video sync method\n-r rate  set frame rate\n": "-vsync",
+        }
+        for help_text, expected in helps.items():
+            app.ffmpeg_passthrough_args.cache_clear()
+            with mock.patch.object(app.subprocess, "run",
+                                   return_value=types.SimpleNamespace(stdout=help_text)):
+                self.assertEqual(app.ffmpeg_passthrough_args(), (expected, "passthrough"))
+        app.ffmpeg_passthrough_args.cache_clear()
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_real_ffmpeg_keeps_frames_with_our_options(self):
+        # Runs the app's camera options through this system's ffmpeg: catches
+        # options it doesn't know and the dropped-frames problem.
+        app.ffmpeg_passthrough_args.cache_clear()
+        app.ffmpeg_passthrough_args()          # real detection, before Popen is mocked
+        jpeg = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc=size=320x240", "-frames:v", "1", "-f", "mjpeg", "-"],
+            capture_output=True, check=True).stdout
+        cmd = self.spawn_command()
+        cmd = cmd[:cmd.index("-pix_fmt")] + ["-f", "framemd5", "-"]
+        r = subprocess.run(cmd, input=jpeg * 30, capture_output=True)
+        frames = [l for l in r.stdout.decode().splitlines() if l and not l.startswith("#")]
+        self.assertEqual(r.returncode, 0, r.stderr.decode()[-500:])
+        self.assertGreaterEqual(len(frames), 25, r.stderr.decode()[-500:])
 
 
 class PageScriptTest(unittest.TestCase):

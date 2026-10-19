@@ -9,19 +9,31 @@ permissions:
 
 jobs:
   test:
+    # Each supported system runs the tests with its own packages (the
+    # versions users get from apt), then checks the built .deb can install.
+    name: ${{ matrix.image }}
     runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:12", "debian:13"]
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
+      - name: Install the system's packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates python3 \
+            python3-aiohttp python3-qrcode ffmpeg nodejs dpkg-dev desktop-file-utils
+
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Show versions
         run: |
-          python -m pip install -r requirements.txt
-          sudo apt-get update
-          sudo apt-get install -y desktop-file-utils
+          . /etc/os-release && echo "$PRETTY_NAME"
+          python3 -c "import sys, aiohttp; print('python', sys.version.split()[0], '| aiohttp', aiohttp.__version__)"
+          dpkg-query -W python3-qrcode ffmpeg
 
       - name: Check shell scripts and app entry
         run: |
@@ -31,9 +43,15 @@ jobs:
           desktop-file-validate packaging/phone-mic-cam.desktop
 
       - name: Run tests (also builds the .deb)
-        run: python -m unittest discover -s tests -v
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Check the .deb installs here
+        run: |
+          apt-get install --simulate -y ./dist/phone-mic-cam_*_all.deb | tee simulate.txt
+          grep -q '^Inst phone-mic-cam' simulate.txt
 
       - name: Upload the .deb
+        if: matrix.image == 'ubuntu:24.04'
         uses: actions/upload-artifact@v4
         with:
           name: phone-mic-cam-deb
