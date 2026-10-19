@@ -38,8 +38,8 @@ them back over WebSockets.
   command must work)
 - Python 3 and `openssl`
 - The phone and the computer on the **same Wi-Fi network**
-- For the camera only: `ffmpeg` and the `v4l2loopback` kernel module (see
-  below)
+- For the camera only: `ffmpeg` and the `v4l2loopback` webcam driver (see
+  [Camera setup](#camera-setup-the-webcam-driver))
 
 ## Installation
 
@@ -50,22 +50,60 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-### Optional: camera support
+## Camera setup: the webcam driver
 
-Install the virtual-webcam driver and `ffmpeg`, then load the driver:
+The camera feature needs **v4l2loopback**, a free Linux kernel driver that
+creates a *virtual webcam*: a camera device that apps can select like a real
+one but that has no hardware behind it. Phone Mic Cam receives video from
+your phone and writes it into this virtual webcam with `ffmpeg`, so apps see
+it as a camera called **Phone Cam**.
+
+Linux has no built-in way for a program to create a webcam, so the driver is
+needed. **You only need it for the camera. Without it, the script still works
+as a microphone.**
+
+### 1. Install the driver and ffmpeg
 
 ```bash
-sudo apt install ffmpeg v4l2loopback-dkms
+sudo apt install ffmpeg v4l2loopback-dkms linux-headers-$(uname -r)
+```
+
+The driver is compiled for your kernel during installation, which needs your
+kernel's headers, so the command installs them too.
+
+### 2. Load the driver
+
+```bash
 sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="Phone Cam" exclusive_caps=1
 ```
 
-- `card_label` must be exactly `Phone Cam`. That's how the script finds the
-  device.
-- `exclusive_caps=1` is needed for Chrome and other browsers to list the
-  camera.
-- Run the `modprobe` command again after every reboot.
+| Option | Meaning |
+|---|---|
+| `devices=1` | Create one virtual webcam. |
+| `video_nr=10` | Use `/dev/video10`, which keeps it clear of real cameras. |
+| `card_label="Phone Cam"` | The name apps show. It must be exactly this, because that's how the script finds the device. |
+| `exclusive_caps=1` | Needed for Chrome and other browsers to list the camera. |
 
-**Secure Boot:** if `modprobe` fails with `Key was rejected by service`,
+### 3. Check that it worked
+
+```bash
+cat /sys/class/video4linux/video10/name
+```
+
+This should print `Phone Cam`. When you start the script, it should report
+"'Phone Cam' webcam available at /dev/video10".
+
+### 4. (Optional) Load it automatically at boot
+
+Without this, run step 2 again after every reboot.
+
+```bash
+echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
+echo 'options v4l2loopback devices=1 video_nr=10 card_label="Phone Cam" exclusive_caps=1' | sudo tee /etc/modprobe.d/v4l2loopback.conf
+```
+
+### If step 2 fails with "Key was rejected by service"
+
 Secure Boot is rejecting the driver because its signing key isn't trusted
 yet. Enroll the key that Ubuntu signed it with. You only need to do this once:
 
@@ -76,9 +114,21 @@ sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
 `mokutil` asks you to choose a one-time password. Reboot, and a blue **MOK
 management** screen appears. Press a key quickly, because it times out after
 about 10 seconds. Choose **Enroll MOK → Continue → Yes**, enter the password,
-and reboot. Then run the `modprobe` command again.
+and reboot. Then run step 2 again.
 
-Without camera support, the script still runs and works as a mic only.
+### Removing the driver
+
+```bash
+sudo modprobe -r v4l2loopback
+sudo rm -f /etc/modules-load.d/v4l2loopback.conf /etc/modprobe.d/v4l2loopback.conf
+sudo apt remove v4l2loopback-dkms
+```
+
+### Other Linux distributions
+
+The commands above are for Ubuntu and Debian. Fedora gets the driver from
+RPM Fusion (`akmod-v4l2loopback`), and Arch has `v4l2loopback-dkms` plus
+`linux-headers`. These haven't been tested yet.
 
 ## Usage
 
@@ -133,9 +183,9 @@ screen from locking.
 | `Port 8443 is already in use` | Another copy is already running. Stop it first with Ctrl+C. |
 | Phone can't open the page | Check that both devices are on the same Wi-Fi. If you use `ufw`, run `sudo ufw allow 8443/tcp`. |
 | "Reconnecting… scan the new QR code" | The script was restarted, so the old link's pairing code is no longer valid. Scan the new QR code. |
-| "Your PC has no virtual camera set up" | Set up the camera (see above), then restart the script. |
-| `Camera disabled: no v4l2loopback device named 'Phone Cam'` | The driver was loaded with a different `card_label`. Reload it: `sudo modprobe -r v4l2loopback`, then run the `modprobe` command above. |
-| Camera not listed in Chrome | Load `v4l2loopback` with `exclusive_caps=1`. |
+| "Your PC has no virtual camera set up" | Follow [Camera setup](#camera-setup-the-webcam-driver), then restart the script. |
+| `Camera disabled: no v4l2loopback device named 'Phone Cam'` | The driver isn't loaded, or was loaded with a different `card_label`. Check with step 3 of [Camera setup](#camera-setup-the-webcam-driver). If the name is wrong, unload it with `sudo modprobe -r v4l2loopback` and repeat step 2. |
+| Camera not listed in Chrome | The driver was loaded without `exclusive_caps=1`. Unload it and repeat step 2. |
 | Mic is still "Phone Mic" after a crash | Choose your normal microphone in Sound settings. |
 | Phone goes **Live** with no call or recording | Something is still reading the mic, such as an open Sound settings input meter or a browser tab that kept mic access. Close it, or check which apps are using the mic with `pactl list source-outputs`. |
 | The first word gets cut off | The phone needs a moment to switch on. Start talking about a second after you press the app's mic button, or use `--mic-always-on`. |
