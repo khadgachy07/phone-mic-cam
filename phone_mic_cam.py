@@ -21,9 +21,11 @@ Without it the script runs mic-only.
 SPDX-License-Identifier: MIT
 """
 import argparse
+import asyncio
 import glob
 import hmac
 import html
+import json
 import os
 import secrets
 import shutil
@@ -65,6 +67,9 @@ buf_lock = threading.Lock()
 stop_event = threading.Event()
 cam = None                        # VirtualCam, or None when unavailable
 clients = set()                   # open phone WebSockets, closed on shutdown
+mic_clients = set()               # the subset streaming the mic
+mic_wanted = True                 # an app is recording; stays True if we can't tell
+MIC_OFF_DELAY = 3                 # seconds without a recording app before mic off
 
 
 # ---------------------------------------------------------------- audio side
@@ -275,11 +280,25 @@ const btn = document.getElementById('btn'), st = document.getElementById('status
 let ctx, stream, ws, wakeLock, running = false;
 const say = t => st.textContent = t;
 
+// The PC sends 'on' while an app there records from the mic, 'off' when none
+// does; the mic only captures and sends audio while 'on'.
+let live = false;
+function setLive(on) {
+  live = on;
+  if (stream) stream.getAudioTracks().forEach(t => t.enabled = on);
+  if (!on) lvl.style.width = '0';
+  say(on ? 'Live: your PC is hearing you'
+         : 'Ready: turns on when an app on your PC uses the mic');
+}
+
 function connect() {
   ws = new WebSocket(`wss://${location.host}/ws?t=${TOKEN}`);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => say('Live: your PC is hearing you');
-  ws.onclose = () => { if (running) { say(RECONNECTING); setTimeout(connect, 1000); } };
+  ws.onmessage = e => { if (typeof e.data === 'string') setLive(e.data === 'on'); };
+  ws.onclose = () => {
+    if (!running) return;
+    setLive(false); say(RECONNECTING); setTimeout(connect, 1000);
+  };
 }
 
 async function keepAwake() {
@@ -295,17 +314,19 @@ async function start() {
   const node = new AudioWorkletNode(ctx, 'pcm');
   ctx.createMediaStreamSource(stream).connect(node).connect(ctx.destination);
   node.port.onmessage = e => {
+    if (!live) return;
     if (ws && ws.readyState === 1) ws.send(e.data);
     const s = new Int16Array(e.data); let p = 0;
     for (let i = 0; i < s.length; i += 8) p = Math.max(p, Math.abs(s[i]));
     lvl.style.width = Math.min(100, p / 200) + '%';
   };
+  setLive(false);
   running = true; connect(); keepAwake();
   btn.textContent = 'Stop'; btn.classList.add('on');
 }
 
 function stop() {
-  running = false;
+  running = false; live = false;
   if (ws) ws.close();
   if (stream) stream.getTracks().forEach(t => t.stop());
   if (ctx) ctx.close();
@@ -434,13 +455,16 @@ async def ws_handler(request):
     ws = web.WebSocketResponse(max_msg_size=1 << 20)
     await ws.prepare(request)
     clients.add(ws)
+    mic_clients.add(ws)
     print(f"Phone mic connected from {request.remote}")
     try:
+        await ws.send_str("on" if mic_wanted else "off")
         async for msg in ws:
             if msg.type == WSMsgType.BINARY:
                 feed(msg.data)
     finally:
         clients.discard(ws)
+        mic_clients.discard(ws)
     print("Phone mic disconnected")
     return ws
 
@@ -463,6 +487,95 @@ async def video_handler(request):
         clients.discard(ws)
     print("Phone camera disconnected")
     return ws
+
+
+async def pactl_json(*args):
+    proc = await asyncio.create_subprocess_exec(
+        "pactl", "-f", "json", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await proc.communicate()
+    return json.loads(out or b"[]")
+
+
+async def mic_in_use() -> bool:
+    """True while any app on this computer is recording from the virtual mic."""
+    sources = await pactl_json("list", "short", "sources")
+    ids = {s["index"] for s in sources if s["name"] == SOURCE}
+    outputs = await pactl_json("list", "source-outputs")
+    return any(o["source"] in ids and not o["corked"] for o in outputs)
+
+
+async def set_mic_wanted(wanted: bool, quiet=False):
+    global mic_wanted
+    if wanted == mic_wanted:
+        return
+    mic_wanted = wanted
+    if not quiet:
+        print("An app is using the mic: phone mic on" if wanted else
+              "No app is using the mic: phone mic off")
+    for ws in list(mic_clients):
+        try:
+            await ws.send_str("on" if wanted else "off")
+        except ConnectionError:
+            pass                     # closing; its handler cleans up
+
+
+async def watch_mic_demand():
+    """Follow PulseAudio events and switch the phone mic on/off to match."""
+    proc = turn_off = None
+
+    async def turn_off_later():
+        await asyncio.sleep(MIC_OFF_DELAY)       # apps often reopen the mic
+        if not await mic_in_use():
+            await set_mic_wanted(False)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pactl", "subscribe", stdout=asyncio.subprocess.PIPE)
+        await set_mic_wanted(await mic_in_use())
+        while line := await proc.stdout.readline():
+            if b"source-output" not in line:
+                continue
+            if turn_off:
+                turn_off.cancel()
+                turn_off = None
+            if await mic_in_use():
+                await set_mic_wanted(True)
+            elif mic_wanted:
+                turn_off = asyncio.create_task(turn_off_later())
+        print("pactl subscribe exited; leaving the phone mic always on")
+    except (OSError, ValueError, KeyError) as e:
+        print(f"Can't watch mic usage ({e}); leaving the phone mic always on")
+    finally:
+        if turn_off:
+            turn_off.cancel()
+        if proc and proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+    await set_mic_wanted(True, quiet=True)     # fallback already explained above
+
+
+def mic_watch_hooks(enabled):
+    task = None
+
+    async def start(app):
+        nonlocal task
+        global mic_wanted
+        if enabled:
+            mic_wanted = False
+            task = asyncio.create_task(watch_mic_demand())
+        else:
+            print("  Phone mic is always on (--mic-always-on).")
+
+    async def stop(app):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    return start, stop
 
 
 async def close_clients(app):
@@ -544,6 +657,8 @@ def main():
     parser = argparse.ArgumentParser(description="Use your phone as this computer's mic and camera.")
     parser.add_argument("--no-browser", action="store_true",
                         help="don't open the QR code page in this computer's browser")
+    parser.add_argument("--mic-always-on", action="store_true",
+                        help="stream the phone mic all the time, not only while an app records")
     args = parser.parse_args()
     # Check before touching audio: a second copy would remove the first one's mic.
     if not port_free(PORT):
@@ -563,8 +678,11 @@ def main():
 
     phone_url = f"https://{lan_ip()}:{PORT}/?t={TOKEN}"
     start_desktop, stop_desktop = desktop_page_hooks(phone_url, not args.no_browser)
+    start_watch, stop_watch = mic_watch_hooks(not args.mic_always_on)
     app.on_startup.append(start_desktop)
+    app.on_startup.append(start_watch)
     app.on_shutdown.append(close_clients)
+    app.on_cleanup.append(stop_watch)
     app.on_cleanup.append(stop_desktop)
 
     print(f"\n  '{MIC_LABEL}' is now your default microphone.")

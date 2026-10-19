@@ -97,6 +97,20 @@ Without camera support, the script still runs and works as a mic only.
 5. In your apps, choose **Phone Mic** and **Phone Cam** if they don't use
    them automatically.
 
+### The mic turns on automatically
+
+After you tap **Start mic** once, the phone shows **Ready**. It switches to
+**Live** by itself whenever an app on the computer starts recording from
+Phone Mic, for example a browser's mic button, a voice chat or a recorder.
+It goes back to **Ready** about 3 seconds after the last app stops. While
+**Ready**, the phone sends no audio.
+
+The one tap is needed because phone browsers only allow mic access after the
+user taps something on the page.
+
+To stream the mic all the time instead, run with `--mic-always-on`. The
+script also falls back to always-on if it can't watch PulseAudio.
+
 Keep the page open and the phone's screen on. The page tries to stop the
 screen from locking.
 
@@ -123,6 +137,8 @@ screen from locking.
 | `Camera disabled: no v4l2loopback device named 'Phone Cam'` | The driver was loaded with a different `card_label`. Reload it: `sudo modprobe -r v4l2loopback`, then run the `modprobe` command above. |
 | Camera not listed in Chrome | Load `v4l2loopback` with `exclusive_caps=1`. |
 | Mic is still "Phone Mic" after a crash | Choose your normal microphone in Sound settings. |
+| Phone goes **Live** with no call or recording | Something is still reading the mic, such as an open Sound settings input meter or a browser tab that kept mic access. Close it, or check which apps are using the mic with `pactl list source-outputs`. |
+| The first word gets cut off | The phone needs a moment to switch on. Start talking about a second after you press the app's mic button, or use `--mic-always-on`. |
 
 ## Limitations
 
