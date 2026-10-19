@@ -813,7 +813,8 @@ def fatal(message):
 
 def main():
     global cam, mic_always_on
-    parser = argparse.ArgumentParser(description="Use your phone as this computer's mic and camera.")
+    parser = argparse.ArgumentParser(prog="phone-mic-cam",
+                                     description="Use your phone as this computer's mic and camera.")
     parser.add_argument("--no-browser", action="store_true",
                         help="don't open the control page in this computer's browser")
     parser.add_argument("--mic-always-on", action="store_true",

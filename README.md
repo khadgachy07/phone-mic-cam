@@ -129,6 +129,13 @@ create a webcam, which is why the driver is needed.
 | Phone goes **Live** with no call or recording | Something is still reading the mic, such as an open Sound settings input meter or a browser tab that kept mic access. Close it, or check which apps are using the mic with `pactl list source-outputs`. |
 | The first word gets cut off | The phone needs a moment to switch on. Start talking about a second after you press the app's mic button, or use `--mic-always-on`. |
 
+## Known issues
+
+- **0.2.0:** on iPhone, **Start camera** may be refused with "The request is
+  not allowed by the user agent or the platform in the current context". The
+  microphone works. A fix is planned for the next version. Running from
+  source (see [Development](#development)) isn't affected in our testing.
+
 ## Limitations
 
 - Ubuntu and Debian-based Linux only for now.
