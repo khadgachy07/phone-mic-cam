@@ -47,7 +47,7 @@ except ImportError as e:
     sys.exit(f"Missing Python package '{e.name}'. Install with:  "
              "sudo apt install python3-aiohttp python3-qrcode  (or pip install -r requirements.txt)")
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 RATE = 48000                      # samples/sec, mono, signed 16-bit
 CHUNK_MS = 10
@@ -374,9 +374,32 @@ function stop() {
   btn.textContent = 'Start mic'; btn.classList.remove('on'); say('Stopped');
 }
 
+// When the browser refuses the mic or camera, tell the PC so its log shows
+// why and in what state, and tell the user what to do.
+function report(what, e) {
+  fetch(`/report?t=${TOKEN}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({what, name: e.name, message: e.message,
+                          mic: running ? (live ? 'Live' : 'Ready') : 'off',
+                          page: document.visibilityState}),
+  }).catch(() => {});
+}
+
+function explain(what, e) {
+  if (e.name === 'NotAllowedError')
+    return `Safari refused the ${what}. Tap the button to try again. If it keeps happening: ` +
+           `tap aA in the address bar → Website Settings → ` +
+           `${what === 'camera' ? 'Camera' : 'Microphone'} → Allow.`;
+  if (e.name === 'NotReadableError')
+    return `The ${what} is busy, probably in another app (FaceTime, Camera…). ` +
+           `Close it and try again.`;
+  return `${what === 'camera' ? 'Camera' : 'Microphone'} error: ${e.message}`;
+}
+
 btn.onclick = async () => {
   if (running) return stop();
-  try { await start(); } catch (e) { say('Error: ' + e.message); stop(); }
+  try { await start(); }
+  catch (e) { report('microphone', e); stop(); say(explain('microphone', e)); }
 };
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && (running || camRunning)) keepAwake();
@@ -443,11 +466,16 @@ function stopCam() {
 
 camBtn.onclick = async () => {
   if (camRunning) return stopCam();
-  try { await startCam(); } catch (e) { stopCam(); camSay('Camera error: ' + e.message); }
+  try { await startCam(); }
+  catch (e) {
+    report('camera', e); stopCam(); camSay(explain('camera', e));
+    camBtn.textContent = 'Try camera again';
+  }
 };
 flipBtn.onclick = async () => {
   facing = facing === 'user' ? 'environment' : 'user';
-  if (camRunning) try { await openCamera(); } catch (e) { camSay('Camera error: ' + e.message); }
+  if (camRunning) try { await openCamera(); }
+  catch (e) { report('camera', e); camSay(explain('camera', e)); }
 };
 </script></body></html>"""
 
@@ -586,6 +614,33 @@ async def video_handler(request):
         cam_clients.discard(ws)
     print("Phone camera disconnected")
     return ws
+
+
+MAX_REPORT = 4096                 # bytes; reports are a few short fields
+
+
+def clean(value, limit):
+    """Untrusted text from the phone, made safe to print as part of one log line."""
+    return "".join(c if c.isprintable() else "?" for c in str(value)[:limit])
+
+
+async def report_handler(request):
+    """Log why the phone's browser refused the mic or camera."""
+    if not authorized(request):
+        raise web.HTTPForbidden()
+    if (request.content_length or 0) > MAX_REPORT:
+        raise web.HTTPRequestEntityTooLarge(max_size=MAX_REPORT,
+                                            actual_size=request.content_length)
+    try:
+        r = json.loads(await request.content.read(MAX_REPORT))
+    except ValueError:
+        raise web.HTTPBadRequest()
+    if not isinstance(r, dict):
+        raise web.HTTPBadRequest()
+    print(f"{time.strftime('%H:%M:%S')} Phone {clean(r.get('what'), 20)} refused: "
+          f"{clean(r.get('name'), 60)}: {clean(r.get('message'), 200)} "
+          f"(mic {clean(r.get('mic'), 10)}, page {clean(r.get('page'), 10)})")
+    return web.Response(status=204)
 
 
 async def pactl_json(*args):
@@ -848,6 +903,7 @@ def main():
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/video", video_handler)
+    app.router.add_post("/report", report_handler)
     sslctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     sslctx.load_cert_chain(CERT, KEY)
 

@@ -131,10 +131,13 @@ create a webcam, which is why the driver is needed.
 
 ## Known issues
 
-- **0.2.0:** on iPhone, **Start camera** may be refused with "The request is
-  not allowed by the user agent or the platform in the current context". The
-  microphone works. A fix is planned for the next version. Running from
-  source (see [Development](#development)) isn't affected in our testing.
+- On iPhone, **Start camera** is sometimes refused with "The request is not
+  allowed by the user agent or the platform in the current context", and
+  works when tried again. The microphone isn't affected. Since 0.2.1 the phone
+  shows what to do, and the computer's log records each refusal with the
+  error and the mic's state at the time. If it happens to you, please open an
+  issue with the matching lines from
+  `~/.local/state/phone-mic-cam/last-run.log`.
 
 ## Limitations
 
