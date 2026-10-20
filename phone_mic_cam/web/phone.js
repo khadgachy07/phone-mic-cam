@@ -96,7 +96,7 @@ function stop() {
 function report(what, e) {
   fetch(`/report?t=${TOKEN}`, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({what, name: e.name, message: e.message,
+    body: JSON.stringify({what, step: e.step || '', name: e.name, message: e.message,
                           mic: running ? (live ? 'Live' : 'Ready') : 'off',
                           page: document.visibilityState}),
   }).catch(() => {});
@@ -131,6 +131,9 @@ const canvas = document.createElement('canvas');
 canvas.width = CAM_W; canvas.height = CAM_H;
 const g = canvas.getContext('2d');
 let camStream, camWs, camTimer, camRunning = false, encoding = false, facing = 'user';
+// Safari can grant the camera but refuse to play the preview (frames are
+// copied from it) outside a tap; then the next tap only starts the preview.
+let previewBlocked = false;
 let loopId = 0;                   // bumped to end the current frame loop
 const camSay = t => camSt.textContent = t;
 
@@ -148,14 +151,22 @@ function camConnect() {
   };
 }
 
+// Both steps fail with the same NotAllowedError, so mark which one did.
 async function openCamera() {
   if (camStream) camStream.getTracks().forEach(t => t.stop());
-  camStream = await navigator.mediaDevices.getUserMedia({video: {
-    facingMode: facing, width: {ideal: CAM_W}, height: {ideal: CAM_H}, frameRate: {ideal: CAM_FPS} }});
-  video.srcObject = camStream;
-  video.classList.toggle('mirror', facing === 'user');
-  await video.play();
+  let step = 'permission';
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({video: {
+      facingMode: facing, width: {ideal: CAM_W}, height: {ideal: CAM_H}, frameRate: {ideal: CAM_FPS} }});
+    step = 'preview';
+    video.srcObject = camStream;
+    video.classList.toggle('mirror', facing === 'user');
+    video.style.display = 'block';        // Safari is stricter about playing a hidden video
+    await video.play();
+  } catch (e) { e.step = step; throw e; }
 }
+
+const previewRefused = e => e.name === 'NotAllowedError' && e.step === 'preview';
 
 function sendFrame() {
   const vw = video.videoWidth, vh = video.videoHeight;
@@ -188,15 +199,15 @@ function startFrameLoop() {
 }
 
 async function startCam() {
-  await openCamera();
-  video.style.display = 'block';
+  if (previewBlocked) { previewBlocked = false; await video.play(); }   // inside the tap
+  else await openCamera();
   camRunning = true; camConnect(); keepAwake();
   startFrameLoop();
   camBtn.textContent = 'Stop camera'; camBtn.classList.add('on');
 }
 
 function stopCam() {
-  camRunning = false;
+  camRunning = false; previewBlocked = false;
   loopId++;
   clearTimeout(camReconnect);
   clearInterval(camTimer);
@@ -211,12 +222,31 @@ camBtn.onclick = async () => {
   if (camRunning) return stopCam();
   try { await startCam(); }
   catch (e) {
-    report('camera', e); stopCam(); camSay(explain('camera', e));
+    report('camera', e);
+    if (previewRefused(e)) {
+      previewBlocked = true;
+      camSay('Safari paused the preview. Tap Start camera once more.');
+      return;
+    }
+    stopCam(); camSay(explain('camera', e));
     camBtn.textContent = 'Try camera again';
   }
 };
 flipBtn.onclick = async () => {
   facing = facing === 'user' ? 'environment' : 'user';
+  if (previewBlocked) stopCam();          // the held stream faces the old way; Start reopens
   if (camRunning) try { await openCamera(); startFrameLoop(); }
-  catch (e) { report('camera', e); camSay(explain('camera', e)); }
+  catch (e) {
+    report('camera', e);
+    if (previewRefused(e)) { startFrameLoop(); camSay('Safari paused the preview. Tap the preview to resume.'); }
+    else camSay(explain('camera', e));
+  }
 };
+// A tap on a paused preview resumes it; the frame loop picks up the new frames.
+video.onclick = () => {
+  if (camRunning && video.paused) video.play().catch(e => report('camera', e));
+};
+// However the preview restarts (that tap, or autoplay), clear the paused message.
+video.addEventListener('playing', () => {
+  if (camRunning && camWs && camWs.readyState === 1) camSay('Camera live: your PC is seeing you');
+});

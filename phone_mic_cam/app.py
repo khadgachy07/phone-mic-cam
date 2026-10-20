@@ -69,8 +69,15 @@ def print_qr(url):
 
 
 def log_to_file(path):
-    """Send this run's output (ours and ffmpeg's) to a fresh log file."""
+    """Send this run's output (ours and ffmpeg's) to a fresh log file.
+
+    The previous run's log is kept as <name>.previous<ext>, so a problem isn't
+    lost when the app is restarted; it keeps its 0600 permissions.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        root, ext = os.path.splitext(path)
+        os.replace(path, f"{root}.previous{ext}")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)          # it contains the pairing link; an older log may be readable
     sys.stdout.flush()

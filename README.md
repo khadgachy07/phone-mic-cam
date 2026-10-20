@@ -125,7 +125,7 @@ create a webcam, which is why the driver is needed.
 | Problem | Fix |
 |---|---|
 | The camera shows **Not available** | The control page explains why and how to fix it, for example the Secure Boot step. |
-| Nothing happens when you open the app | Look at the log from the last run: `~/.local/state/phone-mic-cam/last-run.log`. |
+| Nothing happens when you open the app | Look at the log from the last run: `~/.local/state/phone-mic-cam/last-run.log`. The run before that is kept as `last-run.previous.log`. |
 | "Port 8443 is already in use by another program" | Another program uses that port. Close it and open Phone Mic Cam again. |
 | Phone can't open the page | Check that both devices are on the same Wi-Fi. If you use `ufw`, run `sudo ufw allow 8443/tcp`. |
 | "Reconnecting… scan the new QR code" | The app was restarted, so the old link's pairing code is no longer valid. Scan the new QR code. |
@@ -138,11 +138,13 @@ create a webcam, which is why the driver is needed.
 
 - On iPhone, **Start camera** is sometimes refused with "The request is not
   allowed by the user agent or the platform in the current context", and
-  works when tried again. The microphone isn't affected. Since 0.2.1 the phone
-  shows what to do, and the computer's log records each refusal with the
-  error and the mic's state at the time. If it happens to you, please open an
-  issue with the matching lines from
-  `~/.local/state/phone-mic-cam/last-run.log`.
+  works when tried again. The microphone isn't affected. Since 0.4.1, when
+  Safari grants the camera but pauses its preview, the phone asks for one more
+  tap instead of failing, and the computer's log records which step was
+  refused (`at permission` or `at preview`). If it happens to you, please open
+  an issue with the matching "Phone camera refused" lines from
+  `~/.local/state/phone-mic-cam/last-run.log` (or `last-run.previous.log` if
+  you restarted the app since).
 
 ## Limitations
 

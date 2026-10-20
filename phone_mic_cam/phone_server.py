@@ -104,7 +104,8 @@ async def report_handler(request):
         raise web.HTTPBadRequest()
     if not isinstance(r, dict):
         raise web.HTTPBadRequest()
-    print(f"{time.strftime('%H:%M:%S')} Phone {clean(r.get('what'), 20)} refused: "
+    step = f" at {clean(r.get('step'), 12)}" if r.get("step") else ""
+    print(f"{time.strftime('%H:%M:%S')} Phone {clean(r.get('what'), 20)} refused{step}: "
           f"{clean(r.get('name'), 60)}: {clean(r.get('message'), 200)} "
           f"(mic {clean(r.get('mic'), 10)}, page {clean(r.get('page'), 10)})")
     return web.Response(status=204)

@@ -209,6 +209,18 @@ class ReportTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(mic Ready, page visible)", log)
         self.assertNotIn("A" * 201, log)
 
+    async def test_logs_which_step_was_refused(self):
+        # Safari gives the same NotAllowedError for the camera permission and
+        # for playing the preview; the step tells them apart.
+        report = {"what": "camera", "step": "preview", "name": "NotAllowedError",
+                  "message": "not allowed", "mic": "off", "page": "visible"}
+        _, log = await self.post(f"?t={phone_server.TOKEN}", json=report)
+        self.assertIn("Phone camera refused at preview: NotAllowedError: not allowed", log)
+        report["step"] = "permission\nFAKE" + "B" * 50
+        _, log = await self.post(f"?t={phone_server.TOKEN}", json=report)
+        self.assertIn("refused at permission?F: NotAllowedError", log)
+        self.assertEqual(log.count("\n"), 1)
+
 
 class LogFileTest(unittest.TestCase):
     def setUp(self):
@@ -233,10 +245,11 @@ class LogFileTest(unittest.TestCase):
         with open(self.log) as f:
             self.assertIn("Phone camera refused", f.read())
 
-    def test_log_to_file_replaces_previous_run_and_catches_child_output(self):
+    def test_log_to_file_starts_fresh_keeps_previous_run_and_catches_child_output(self):
         os.makedirs(os.path.dirname(self.log))
         with open(self.log, "w") as f:
             f.write("previous run\n")
+        os.chmod(self.log, 0o600)
         code = ("import os, sys; sys.path.insert(0, sys.argv[1]); from phone_mic_cam import app as a; "
                 "a.log_to_file(sys.argv[2]); print('from python'); "
                 "os.system('echo from a child process')")
@@ -247,6 +260,11 @@ class LogFileTest(unittest.TestCase):
         self.assertIn("from python", text)
         self.assertIn("from a child process", text)
         self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
+        # Regression: a restart wiped the log, losing the phone's refusal reports.
+        previous = os.path.join(os.path.dirname(self.log), "last-run.previous.log")
+        with open(previous) as f:
+            self.assertEqual(f.read(), "previous run\n")
+        self.assertEqual(os.stat(previous).st_mode & 0o777, 0o600)
 
     def test_launcher_passes_log_file_without_touching_it(self):
         fake_bin = os.path.join(self.tmp.name, "bin")
