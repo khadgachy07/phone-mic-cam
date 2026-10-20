@@ -18,4 +18,4 @@ microphone is restored.
 
 SPDX-License-Identifier: MIT
 """
-__version__ = "0.4.1"
+__version__ = "0.5.0"

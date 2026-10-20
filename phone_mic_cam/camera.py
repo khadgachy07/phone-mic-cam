@@ -18,6 +18,12 @@ MOK_KEY = "/var/lib/shim-signed/mok/MOK.der"   # Ubuntu's DKMS module-signing ke
 CAM_FPS = 30
 
 
+# Phone Cam's picture size. Apps using a webcam expect its size to stay put,
+# so frames of any size the phone sends (720p, or 480p to save data) are
+# scaled to this.
+CAM_SIZE = (1280, 720)
+
+
 MAX_FRAME = 1 << 21               # 2 MB per JPEG frame
 
 
@@ -77,6 +83,7 @@ class VirtualCam:
              "-fflags", "nobuffer", "-probesize", "32", "-analyzeduration", "0",
              "-f", "mjpeg", "-framerate", str(CAM_FPS),
              "-i", "pipe:0", *ffmpeg_passthrough_args(),
+             "-vf", "scale={}:{}".format(*CAM_SIZE),
              "-pix_fmt", "yuv420p", "-f", "v4l2", self.device],
             stdin=subprocess.PIPE,
         )

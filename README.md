@@ -60,7 +60,24 @@ rate and lag. To finish, press **Stop Phone Mic Cam**. If you close the page,
 open the app again and it reopens the page.
 
 Keep the page open on the phone and its screen on. The page tries to stop the
-screen from locking.
+screen from locking. **Dim screen** turns the page black while it streams, to
+save battery; tap to wake it. If the phone locks or Safari goes to the
+background anyway, the page shows **Tap to resume** when you come back, and one
+tap restarts the mic and camera.
+
+### Camera settings
+
+Under the camera buttons on the phone you can choose:
+
+- **720p** or **480p**: 480p sends less data. Phone Cam always shows 1280×720,
+  so apps using it aren't disturbed when you switch.
+- **30 fps** or **15 fps**: 15 fps halves the data.
+- **High**, **Medium** or **Low** picture quality.
+
+The phone remembers your choices. When the Wi-Fi gets busy, the phone lowers
+the picture quality by itself ("lower quality: Wi-Fi is busy") and raises it
+again once the Wi-Fi catches up, so the camera doesn't hold up the mic. The mic
+also skips audio that couldn't be sent in time rather than playing it late.
 
 ### The mic turns on automatically
 
@@ -150,9 +167,9 @@ create a webcam, which is why the driver is needed.
 
 - Ubuntu 22.04+ and Debian 12+ only for now.
 - iOS stops the mic and camera when Safari goes into the background or the
-  screen locks.
-- Video is sent at 1280×720 landscape. A phone held upright appears with
-  black bars at the sides.
+  screen locks; coming back needs one tap (**Tap to resume**).
+- Phone Cam is 1280×720 landscape. A phone held upright appears with black
+  bars at the sides. 1080p isn't offered.
 - Audio is mono, 48 kHz, with about 40–150 ms of buffering.
 
 ## Development

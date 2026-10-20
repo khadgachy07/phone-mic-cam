@@ -19,6 +19,16 @@
   .status{font-size:17px;opacity:.8;text-align:center;padding:0 16px}
   #bar{width:220px;height:10px;background:#333;border-radius:5px;overflow:hidden}
   #lvl{height:100%;width:0;background:#2c8;transition:width .05s}
+  select{background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:10px;
+         padding:9px 10px;font-size:15px}
+  #dim{background:none;border:1px solid #444;color:#aaa;border-radius:12px;
+       padding:10px 18px;font-size:15px;font-weight:500}
+  .overlay{position:fixed;inset:0;z-index:10;display:none;flex-direction:column;
+           align-items:center;justify-content:center;gap:16px;background:#000}
+  #dimmer{justify-content:flex-end;padding-bottom:48px;box-sizing:border-box;
+          color:#333;font-size:15px}
+  #resume{background:#111;padding:0 24px;box-sizing:border-box}
+  #resumebtn{width:200px;height:200px;border-radius:50%;font-size:22px}
 </style></head><body>
 <button id="btn">Start mic</button>
 <div id="bar"><div id="lvl"></div></div>
@@ -26,6 +36,21 @@
 <video id="preview" playsinline muted autoplay></video>
 <div class="row"><button id="cambtn">Start camera</button><button id="flip">Flip</button></div>
 <div id="camstatus" class="status"></div>
+<div class="row">
+  <select id="size" aria-label="Camera resolution">
+    <option value="720">720p</option><option value="480">480p</option></select>
+  <select id="fps" aria-label="Frames per second">
+    <option value="30">30 fps</option><option value="15">15 fps</option></select>
+  <select id="quality" aria-label="Picture quality">
+    <option value="high">High</option><option value="medium" selected>Medium</option>
+    <option value="low">Low</option></select>
+</div>
+<button id="dim">Dim screen</button>
+<div id="dimmer" class="overlay">Tap to wake</div>
+<div id="resume" class="overlay">
+  <button id="resumebtn">Tap to resume</button>
+  <div class="status">Your phone paused the mic or camera while it was locked or in the background.</div>
+</div>
 <script>
 {{SCRIPT}}
 </script></body></html>

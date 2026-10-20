@@ -26,6 +26,9 @@ const RECONNECTING = 'Reconnecting… (if this persists, scan the new QR code on
 const btn = document.getElementById('btn'), st = document.getElementById('status'),
       lvl = document.getElementById('lvl');
 let ctx, stream, ws, wakeLock, running = false;
+// Audio still waiting to be sent after a Wi-Fi stall would only arrive late;
+// past 150 ms of backlog new audio is dropped so the mic stays current.
+const MIC_BACKLOG = 48000 * 2 * 0.15;
 const say = t => st.textContent = t;
 
 // The PC sends 'on' while an app there records from the mic, 'off' when none
@@ -69,7 +72,7 @@ async function start() {
   ctx.createMediaStreamSource(stream).connect(node).connect(ctx.destination);
   node.port.onmessage = e => {
     if (!live) return;
-    if (ws && ws.readyState === 1) ws.send(e.data);
+    if (ws && ws.readyState === 1 && ws.bufferedAmount < MIC_BACKLOG) ws.send(e.data);
     const s = new Int16Array(e.data); let p = 0;
     for (let i = 0; i < s.length; i += 8) p = Math.max(p, Math.abs(s[i]));
     lvl.style.width = Math.min(100, p / 200) + '%';
@@ -125,6 +128,11 @@ document.addEventListener('visibilitychange', () => {
 
 // ------------------------------------------------------------ camera
 const CAM_W = 1280, CAM_H = 720, CAM_FPS = 30, NO_CAMERA = 4000;
+// The PC always shows 1280x720 (it scales 480p up), so changing a setting
+// never needs a new camera permission or breaks an app using Phone Cam.
+const SIZES = {'720': [1280, 720], '480': [854, 480]};
+const QUALITY = {high: 0.85, medium: 0.7, low: 0.5};
+const settings = {size: '720', fps: '30', quality: 'medium'};
 const camBtn = document.getElementById('cambtn'), flipBtn = document.getElementById('flip'),
       video = document.getElementById('preview'), camSt = document.getElementById('camstatus');
 const canvas = document.createElement('canvas');
@@ -168,16 +176,44 @@ async function openCamera() {
 
 const previewRefused = e => e.name === 'NotAllowedError' && e.step === 'preview';
 
+// Busy Wi-Fi: camera frames queue up on the phone and delay the mic, which
+// shares the link. Lower the JPEG quality while frames wait to be sent, and
+// raise it again once the queue has stayed empty for about a second.
+const MIN_QUALITY = 0.3, BUSY = 64 * 1024;
+function nextQuality(a, target, buffered) {
+  if (buffered > BUSY) {
+    if (a.wait > 0) return {q: Math.min(a.q, target), calm: 0, wait: a.wait - 1};
+    return {q: Math.max(MIN_QUALITY, Math.min(a.q, target) - 0.1), calm: 0, wait: 5};
+  }
+  if (buffered > 0) return {q: Math.min(a.q, target), calm: 0, wait: a.wait};
+  if (a.q < target && a.calm + 1 >= 30) return {q: Math.min(target, a.q + 0.1), calm: 0, wait: 0};
+  return {q: Math.min(a.q, target), calm: a.calm + 1, wait: 0};
+}
+let adapt = {q: 1, calm: 0, wait: 0}, lastSent = 0, wifiBusy = false;
+// Whether a camera frame arriving now should be sent at this fps; the slack
+// absorbs jitter, so at 15 fps every other frame of a 30 fps camera goes.
+const frameDue = (now, last, fps) => now - last >= 1000 / fps - 8;
+
 function sendFrame() {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw || encoding || !camWs || camWs.readyState !== 1) return;
-  if (camWs.bufferedAmount > 512 * 1024) return;      // Wi-Fi is behind: skip a frame
-  const s = Math.min(CAM_W / vw, CAM_H / vh), w = vw * s, h = vh * s;
-  g.fillStyle = '#000'; g.fillRect(0, 0, CAM_W, CAM_H);
-  g.drawImage(video, (CAM_W - w) / 2, (CAM_H - h) / 2, w, h);
-  encoding = true;
+  const now = performance.now();
+  if (!frameDue(now, lastSent, Number(settings.fps))) return;
+  const target = QUALITY[settings.quality];
+  adapt = nextQuality(adapt, target, camWs.bufferedAmount);
+  if (wifiBusy !== adapt.q < target) {
+    wifiBusy = adapt.q < target;
+    camSay(wifiBusy ? 'Camera live (lower quality: Wi-Fi is busy)' : 'Camera live: your PC is seeing you');
+  }
+  if (camWs.bufferedAmount > 256 * 1024) return;      // Wi-Fi is far behind: skip a frame
+  const [cw, ch] = SIZES[settings.size];
+  if (canvas.width !== cw) { canvas.width = cw; canvas.height = ch; }
+  const s = Math.min(cw / vw, ch / vh), w = vw * s, h = vh * s;
+  g.fillStyle = '#000'; g.fillRect(0, 0, cw, ch);
+  g.drawImage(video, (cw - w) / 2, (ch - h) / 2, w, h);
+  encoding = true; lastSent = now;
   canvas.toBlob(b => { encoding = false; if (b && camWs && camWs.readyState === 1) camWs.send(b); },
-                'image/jpeg', 0.7);
+                'image/jpeg', adapt.q);
 }
 
 // Send each new camera frame once. requestVideoFrameCallback fires when the
@@ -202,6 +238,7 @@ async function startCam() {
   if (previewBlocked) { previewBlocked = false; await video.play(); }   // inside the tap
   else await openCamera();
   camRunning = true; camConnect(); keepAwake();
+  adapt = {q: 1, calm: 0, wait: 0}; wifiBusy = false;
   startFrameLoop();
   camBtn.textContent = 'Stop camera'; camBtn.classList.add('on');
 }
@@ -249,4 +286,48 @@ video.onclick = () => {
 // However the preview restarts (that tap, or autoplay), clear the paused message.
 video.addEventListener('playing', () => {
   if (camRunning && camWs && camWs.readyState === 1) camSay('Camera live: your PC is seeing you');
+});
+
+// ------------------------------------------------------------ settings
+// Saved on the phone, so they're the same next time. They apply at once.
+try { Object.assign(settings, JSON.parse(localStorage.getItem('camSettings')) || {}); } catch (e) {}
+for (const name of Object.keys(settings)) {
+  const select = document.getElementById(name);
+  if (![...select.options].some(o => o.value === settings[name])) settings[name] = select.value;
+  select.value = settings[name];
+  select.onchange = () => {
+    settings[name] = select.value;
+    adapt = {q: 1, calm: 0, wait: 0};      // start at the new choice, not at a lowered quality
+    try { localStorage.setItem('camSettings', JSON.stringify(settings)); } catch (e) {}
+  };
+}
+
+// ------------------------------------------------------------ dim screen
+// A black screen while streaming; the page must stay open and awake.
+const dimmer = document.getElementById('dimmer');
+document.getElementById('dim').onclick = () => dimmer.style.display = 'flex';
+dimmer.onclick = () => dimmer.style.display = 'none';
+
+// ------------------------------------------------------------ resume
+// iOS ends the mic and camera when Safari goes to the background or the phone
+// locks. Coming back, one tap restarts whatever ended: the browser only grants
+// the mic and camera from a tap, and both requests start inside this one.
+const resumeBox = document.getElementById('resume');
+function endedByPhone() {
+  const ended = s => !!s && s.getTracks().some(t => t.readyState === 'ended');
+  return {mic: running && (ended(stream) || (!!ctx && ctx.state === 'closed')),
+          cam: camRunning && ended(camStream)};
+}
+function checkResume() {
+  const e = endedByPhone();
+  resumeBox.style.display = e.mic || e.cam ? 'flex' : 'none';
+}
+document.getElementById('resumebtn').onclick = () => {
+  const e = endedByPhone();
+  resumeBox.style.display = 'none';
+  if (e.mic) { stop(); btn.onclick(); }
+  if (e.cam) { stopCam(); camBtn.onclick(); }
+};
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') setTimeout(checkResume, 500);   // let tracks settle
 });

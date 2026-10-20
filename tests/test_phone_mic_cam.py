@@ -502,6 +502,27 @@ class VirtualCamTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr.decode()[-500:])
         self.assertGreaterEqual(len(frames), 25, r.stderr.decode()[-500:])
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_real_ffmpeg_keeps_phone_cam_size_when_the_phone_changes_size(self):
+        # The phone sends 720p or 480p and can switch mid-call; apps using the
+        # webcam must keep getting 1280x720.
+        def jpeg(size):
+            return subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                 "-i", f"testsrc=size={size}", "-frames:v", "1", "-f", "mjpeg", "-"],
+                capture_output=True, check=True).stdout
+        camera.ffmpeg_passthrough_args.cache_clear()
+        camera.ffmpeg_passthrough_args()
+        cmd = self.spawn_command()
+        cmd = cmd[:cmd.index("-f", cmd.index("-pix_fmt"))] + ["-f", "rawvideo", "-"]
+        frames = jpeg("854x480") * 10 + jpeg("1280x720") * 10 + jpeg("854x480") * 10
+        r = subprocess.run(cmd, input=frames, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode()[-500:])
+        w, h = camera.CAM_SIZE
+        frame_bytes = w * h * 3 // 2                  # yuv420p
+        self.assertEqual(len(r.stdout) % frame_bytes, 0, "a frame isn't 1280x720")
+        self.assertGreaterEqual(len(r.stdout) // frame_bytes, 25)
+
 
 class PageScriptTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "node not installed")
@@ -568,6 +589,80 @@ console.log('ok');
 
     def test_no_terminal_mentioned_to_phone_users(self):
         self.assertNotIn("terminal", phone_server.PAGE)
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class CameraQualityTest(unittest.TestCase):
+    """Runs the phone page's nextQuality() in node with a simulated send queue."""
+
+    HARNESS = r"""
+%s
+const check = (label, cond) => { if (!cond) { console.log('FAIL: ' + label); process.exit(1); } };
+let a = {q: 1, calm: 0, wait: 0};
+a = nextQuality(a, 0.7, 0);
+check('starts at the chosen quality', a.q === 0.7);
+a = nextQuality(a, 0.7, BUSY + 1);
+check('busy Wi-Fi lowers quality', Math.abs(a.q - 0.6) < 1e-9);
+for (let i = 0; i < 5; i++) a = nextQuality(a, 0.7, BUSY + 1);
+check('waits a few frames before lowering again', Math.abs(a.q - 0.6) < 1e-9);
+for (let i = 0; i < 100; i++) a = nextQuality(a, 0.7, BUSY + 1);
+check('never below the minimum', a.q === MIN_QUALITY);
+for (let i = 0; i < 29; i++) a = nextQuality(a, 0.7, 0);
+check('stays low until the queue has been empty for a while', a.q === MIN_QUALITY);
+a = nextQuality(a, 0.7, 0);
+check('then steps back up', a.q > MIN_QUALITY);
+a = nextQuality(a, 0.7, 10);
+check('a small queue resets the calm count', a.calm === 0);
+for (let i = 0; i < 1000; i++) a = nextQuality(a, 0.7, 0);
+check('recovers to the chosen quality and no higher', Math.abs(a.q - 0.7) < 1e-9);
+a = nextQuality(a, 0.5, 0);
+check('choosing a lower quality applies at once', a.q === 0.5);
+console.log('ok');
+"""
+
+    def test_quality_follows_the_send_queue(self):
+        js = read_web("phone.js")
+        consts = re.search(r"const MIN_QUALITY = .*?;\n", js).group(0)
+        fn = re.search(r"function nextQuality\(.*?\n\}\n", js, re.S)
+        self.assertIsNotNone(fn, "nextQuality() not found in the phone page")
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(self.HARNESS % (consts + fn.group(0)))
+        try:
+            r = subprocess.run(["node", f.name], capture_output=True, text=True)
+        finally:
+            os.remove(f.name)
+        self.assertEqual(r.stdout.strip(), "ok", r.stdout + r.stderr)
+
+    def test_frame_rate_setting_with_a_30_fps_camera(self):
+        js = read_web("phone.js")
+        due = re.search(r"const frameDue = .*?;\n", js)
+        self.assertIsNotNone(due, "frameDue() not found in the phone page")
+        harness = due.group(0) + r"""
+const sent = fps => { let last = -1e9, n = 0;
+  for (let i = 0; i < 300; i++) {                      // 10 s of a camera with timing jitter
+    const now = i * 1000 / 30 + (i % 3) * 2;
+    if (frameDue(now, last, fps)) { last = now; n++; } }
+  return n / 10; };
+console.log(JSON.stringify([sent(30), sent(15)]));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(harness)
+        try:
+            r = subprocess.run(["node", f.name], capture_output=True, text=True)
+        finally:
+            os.remove(f.name)
+        self.assertEqual(json.loads(r.stdout), [30, 15], r.stderr)
+
+    def test_every_setting_choice_is_known_to_the_script(self):
+        js, html = read_web("phone.js"), read_web("phone.html")
+        tables = {"size": "SIZES", "quality": "QUALITY"}
+        for select, table in tables.items():
+            known = re.search(rf"const {table} = \{{(.*?)\}};", js).group(1)
+            options = re.search(rf'<select id="{select}".*?</select>', html, re.S).group(0)
+            for value in re.findall(r'value="([^"]+)"', options):
+                self.assertRegex(known, rf"'?{value}'?:", f"{select} option {value}")
+        fps = re.search(r'<select id="fps".*?</select>', html, re.S).group(0)
+        self.assertEqual(set(re.findall(r'value="(\d+)"', fps)), {"30", "15"})
 
 
 class PackageTest(unittest.TestCase):
