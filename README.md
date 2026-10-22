@@ -69,12 +69,25 @@ tap restarts the mic and camera.
 
 Under the camera buttons on the phone you can choose:
 
-- **720p** or **480p**: 480p sends less data. Phone Cam always shows 1280×720,
-  so apps using it aren't disturbed when you switch.
+- **1080p** (the default), **720p** or **480p**: smaller sizes send less data.
+  Phone Cam always shows 1920×1080, so apps using it aren't disturbed when you
+  switch.
 - **30 fps** or **15 fps**: 15 fps halves the data.
-- **High**, **Medium** or **Low** picture quality.
+- **High** (the default), **Medium** or **Low** picture quality. Lower
+  quality sends less data.
 
-The phone remembers your choices. When the Wi-Fi gets busy, the phone lowers
+The phone remembers your choices.
+
+Where the phone's browser supports it (Safari on iOS 16.4 and later, recent
+Chrome), video is sent as **H.264** from the phone's hardware encoder. It sends
+only what changes between frames, so it looks much better than one JPEG per
+frame for the same data, and makes 1080p practical. Other browsers send JPEG
+frames, at up to 720p. The control page shows which one is in use.
+
+The phone captures at 1080p and scales down, which gives a sharper picture than
+capturing at a smaller size. Hold the phone sideways: Phone
+Cam is landscape, so an upright phone's picture fills only about a third of it,
+and the phone page reminds you. When the Wi-Fi gets busy, the phone lowers
 the picture quality by itself ("lower quality: Wi-Fi is busy") and raises it
 again once the Wi-Fi catches up, so the camera doesn't hold up the mic. The mic
 also skips audio that couldn't be sent in time rather than playing it late.
@@ -111,7 +124,7 @@ Delete it to remove the certificate too.
  Phone browser                              Computer (phone_mic_cam)
  ─────────────                              ────────────────────────
  mic  ──► 48 kHz PCM ───── wss /ws ──────►  PulseAudio pipe source "Phone Mic"
- cam  ──► JPEG frames ──── wss /video ───►  ffmpeg ──► v4l2loopback "Phone Cam"
+ cam  ──► H.264 (or JPEG) ─ wss /video ───►  ffmpeg ──► v4l2loopback "Phone Cam"
 ```
 
 The app runs a small HTTPS server on port **8443**. Browsers only allow mic
@@ -168,8 +181,8 @@ create a webcam, which is why the driver is needed.
 - Ubuntu 22.04+ and Debian 12+ only for now.
 - iOS stops the mic and camera when Safari goes into the background or the
   screen locks; coming back needs one tap (**Tap to resume**).
-- Phone Cam is 1280×720 landscape. A phone held upright appears with black
-  bars at the sides. 1080p isn't offered.
+- Phone Cam is 1920×1080 landscape. A phone held upright appears with black
+  bars at the sides. Browsers without H.264 encoding send at most 720p.
 - Audio is mono, 48 kHz, with about 40–150 ms of buffering.
 
 ## Development

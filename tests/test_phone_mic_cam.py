@@ -65,10 +65,16 @@ def phone_app():
 class FakeCam:
     def __init__(self):
         self.frames = []
+        self.keys = []
         self.skipped = 0
+        self.codec = "jpeg"
 
-    def push(self, jpeg):
-        self.frames.append(jpeg)
+    def set_codec(self, codec):
+        self.codec = codec
+
+    def push(self, data, key=False):
+        self.frames.append(data)
+        self.keys.append(key)
 
 
 class PairingTest(unittest.TestCase):
@@ -173,6 +179,34 @@ class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.05)
         self.assertEqual(camera.cam.frames, [b"\xff\xd8 a jpeg"])
         self.assertEqual(stats.cam_meter.count, 1)
+        await ws.close()
+
+    async def test_video_h264_strips_the_keyframe_flag(self):
+        camera.cam = FakeCam()
+        ws = await self.client.ws_connect(f"/video?t={phone_server.TOKEN}&codec=h264")
+        await ws.send_bytes(b"\x01\x00\x00\x00\x01key")
+        await ws.send_bytes(b"\x00\x00\x00\x00\x01delta")
+        await ws.send_bytes(b"\xff\xd8 a jpeg on an H.264 connection")
+        await ws.send_str("text")
+        for _ in range(50):
+            if len(camera.cam.frames) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        self.assertEqual(camera.cam.codec, "h264")
+        self.assertEqual(camera.cam.frames, [b"\x00\x00\x00\x01key", b"\x00\x00\x00\x01delta"])
+        self.assertEqual(camera.cam.keys, [True, False])
+        await ws.close()
+
+    async def test_unknown_codec_is_treated_as_jpeg(self):
+        camera.cam = FakeCam()
+        ws = await self.client.ws_connect(f"/video?t={phone_server.TOKEN}&codec=vp9")
+        await ws.send_bytes(b"\xff\xd8 a jpeg")
+        for _ in range(50):
+            if camera.cam.frames:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual((camera.cam.codec, camera.cam.frames), ("jpeg", [b"\xff\xd8 a jpeg"]))
         await ws.close()
 
 
@@ -337,7 +371,7 @@ class ControlPageTest(unittest.IsolatedAsyncioTestCase):
             s = await resp.json()
         self.assertEqual(s["camera_problem"], "no driver")
         self.assertFalse(s["mic_connected"])
-        self.assertEqual(set(s["stats"]), {"cam_fps", "cam_kb_per_sec", "cam_skipped",
+        self.assertEqual(set(s["stats"]), {"cam_fps", "cam_kb_per_sec", "cam_skipped", "cam_codec",
                                            "mic_kb_per_sec", "mic_buffer_ms"})
 
     async def test_stop_needs_token_and_post(self):
@@ -447,18 +481,126 @@ class MeterTest(unittest.TestCase):
 
 
 class VirtualCamTest(unittest.TestCase):
-    def test_counts_frames_replaced_before_ffmpeg_took_them(self):
+    def bare_cam(self, codec):
         cam = camera.VirtualCam.__new__(camera.VirtualCam)     # without its ffmpeg thread
-        cam.frame, cam.skipped, cam.cond = None, 0, threading.Condition()
+        cam.frames, cam.skipped, cam.cond = [], 0, threading.Condition()
+        cam.codec, cam._restart, cam.waiting_for_key = "jpeg", False, False
+        cam.set_codec(codec)
+        return cam
+
+    def test_counts_frames_replaced_before_ffmpeg_took_them(self):
+        cam = self.bare_cam("jpeg")
         cam.push(b"1")
         cam.push(b"2")
         cam.push(b"3")
-        self.assertEqual((cam.frame, cam.skipped), (b"3", 2))
+        self.assertEqual((cam.frames, cam.skipped), ([b"3"], 2))
 
-    def spawn_command(self):
+    def test_h264_keeps_every_frame_in_order_from_a_keyframe(self):
+        cam = self.bare_cam("h264")
+        cam.push(b"d0")                        # can't be decoded without its keyframe
+        cam.push(b"k1", key=True)
+        cam.push(b"d1")
+        cam.push(b"d2")
+        end = camera.FRAME_END
+        self.assertEqual((cam.frames, cam.skipped), ([b"k1" + end, b"d1" + end, b"d2" + end], 1))
+
+    def test_h264_backlog_is_dropped_up_to_the_next_keyframe(self):
+        cam = self.bare_cam("h264")
+        cam.push(b"k", key=True)
+        for i in range(camera.H264_BACKLOG - 1):
+            cam.push(b"d")
+        cam.push(b"late")                      # ffmpeg is behind: queue dropped
+        cam.push(b"d")                         # still no keyframe
+        self.assertEqual(cam.frames, [])
+        self.assertEqual(cam.skipped, camera.H264_BACKLOG + 2)
+        cam.push(b"k2", key=True)
+        self.assertEqual(cam.frames, [b"k2" + camera.FRAME_END])
+
+    def test_changing_codec_restarts_ffmpeg_and_drops_old_frames(self):
+        cam = self.bare_cam("jpeg")
+        cam._restart = False
+        cam.push(b"\xff\xd8")
+        cam.set_codec("h264")
+        self.assertEqual((cam.frames, cam._restart, cam.waiting_for_key), ([], True, True))
+
+    def spawn_command(self, codec="jpeg"):
         with mock.patch.object(subprocess, "Popen") as popen:
-            camera.VirtualCam._spawn(types.SimpleNamespace(device="/dev/video10"))
+            camera.VirtualCam._spawn(types.SimpleNamespace(device="/dev/video10"), codec)
         return popen.call_args.args[0]
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def h264_frames(self, n):
+        """A Baseline H.264 stream like the phone's, split into frames."""
+        encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                  capture_output=True, text=True).stdout
+        if " libx264 " not in encoders:
+            self.skipTest("this ffmpeg has no H.264 encoder to make a test stream")
+        data = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc=size=1280x720:rate=30", "-frames:v", str(n), "-c:v", "libx264",
+             "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-g", "15", "-f", "h264", "-"],
+            capture_output=True, check=True).stdout
+        frames, cur = [], b""
+        for nal in re.split(rb"\x00\x00\x00\x01|\x00\x00\x01", data):
+            if nal:
+                cur += b"\x00\x00\x00\x01" + nal
+                if nal[0] & 31 in (1, 5):            # a slice ends the frame
+                    frames.append(cur)
+                    cur = b""
+        return frames
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_real_ffmpeg_passes_each_h264_frame_on_at_once(self):
+        # Regression: -fflags nobuffer lost every other H.264 frame and held the
+        # rest back 1.7 s, and without a delimiter each frame waited for the
+        # next. Write 10 frames as VirtualCam queues them and keep the pipe
+        # open: all 10 must come out without any more input.
+        frames = self.h264_frames(10)
+        cam = self.bare_cam("h264")
+        for i, f in enumerate(frames):
+            cam.push(f, key=i == 0)
+        camera.ffmpeg_passthrough_args.cache_clear()
+        camera.ffmpeg_passthrough_args()
+        cmd = self.spawn_command("h264")
+        cmd = cmd[:cmd.index("-f", cmd.index("-pix_fmt"))] + ["-f", "rawvideo", "-"]
+        w, h = camera.CAM_SIZE
+        size, got = w * h * 3 // 2, []
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        reader = threading.Thread(target=lambda: [got.append(1) for _ in
+                                                  iter(lambda: proc.stdout.read(size), b"")])
+        reader.start()
+        try:
+            proc.stdin.write(b"".join(cam.frames))
+            proc.stdin.flush()
+            deadline = time.monotonic() + 5
+            while len(got) < 10 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(got), 10)
+        finally:
+            proc.kill()
+            reader.join()
+
+    def test_real_ffmpeg_decodes_the_phones_h264(self):
+        # A Baseline H.264 stream like the phone's, 720p, through the app's own
+        # ffmpeg options: every frame comes out, at Phone Cam's 1920x1080.
+        encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                  capture_output=True, text=True).stdout
+        if " libx264 " not in encoders:
+            self.skipTest("this ffmpeg has no H.264 encoder to make a test stream")
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc=size=1280x720:rate=30", "-frames:v", "30", "-c:v", "libx264",
+             "-profile:v", "baseline", "-pix_fmt", "yuv420p", "-g", "15", "-f", "h264", "-"],
+            capture_output=True, check=True)
+        camera.ffmpeg_passthrough_args.cache_clear()
+        camera.ffmpeg_passthrough_args()
+        cmd = self.spawn_command("h264")
+        cmd = cmd[:cmd.index("-f", cmd.index("-pix_fmt"))] + ["-f", "rawvideo", "-"]
+        out = subprocess.run(cmd, input=r.stdout, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr.decode()[-500:])
+        w, h = camera.CAM_SIZE
+        self.assertEqual(len(out.stdout), 30 * w * h * 3 // 2, out.stderr.decode()[-500:])
 
     def test_ffmpeg_passes_frames_through_when_not_probing(self):
         # Regression: with -probesize 32 ffmpeg guesses 1200k fps and drops
@@ -633,6 +775,39 @@ console.log('ok');
             os.remove(f.name)
         self.assertEqual(r.stdout.strip(), "ok", r.stdout + r.stderr)
 
+    def test_avc_output_becomes_annex_b_with_parameter_sets_on_keyframes(self):
+        js = read_web("phone.js")
+        fns = "".join(re.search(rf"function {name}\(.*?\n\}}\n", js, re.S).group(0)
+                      for name in ("parseAvcC", "toAnnexB"))
+        harness = fns + r"""
+// avcC: version 1, Baseline, level 3.1, 4-byte lengths, one SPS, one PPS
+const avcC = new Uint8Array([1, 0x42, 0xe0, 0x1f, 0xff, 0xe1, 0, 3, 0x67, 0xaa, 0xbb,
+                             1, 0, 2, 0x68, 0xcc]);
+const avc = parseAvcC(new DataView(avcC.buffer));      // descriptions may be views
+const chunk = new Uint8Array([0, 0, 0, 2, 0x65, 0x11, 0, 0, 0, 1, 0x06]);   // IDR slice, SEI
+console.log(JSON.stringify({
+  lenSize: avc.lenSize, sets: avc.sets.map(s => [...s]),
+  key: [...toAnnexB(chunk, avc, true)], delta: [...toAnnexB(new Uint8Array([0, 0, 0, 1, 0x41]), avc, false)],
+  // a keyframe that carries its own SPS/PPS (as Firefox's do) is left as it is
+  ownSets: [...toAnnexB(new Uint8Array([0, 0, 0, 2, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0, 0, 0, 1, 0x65]), avc, true)],
+}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(harness)
+        try:
+            r = subprocess.run(["node", f.name], capture_output=True, text=True)
+        finally:
+            os.remove(f.name)
+        out = json.loads(r.stdout or "null")
+        self.assertIsNotNone(out, r.stderr)
+        self.assertEqual(out["lenSize"], 4)
+        self.assertEqual(out["sets"], [[0x67, 0xaa, 0xbb], [0x68, 0xcc]])
+        sc = [0, 0, 0, 1]
+        self.assertEqual(out["key"], [1] + sc + [0x67, 0xaa, 0xbb] + sc + [0x68, 0xcc]
+                         + sc + [0x65, 0x11] + sc + [0x06])
+        self.assertEqual(out["delta"], [0] + sc + [0x41])
+        self.assertEqual(out["ownSets"], [1] + sc + [0x67, 0x42] + sc + [0x68] + sc + [0x65])
+
     def test_frame_rate_setting_with_a_30_fps_camera(self):
         js = read_web("phone.js")
         due = re.search(r"const frameDue = .*?;\n", js)
@@ -652,6 +827,18 @@ console.log(JSON.stringify([sent(30), sent(15)]));
         finally:
             os.remove(f.name)
         self.assertEqual(json.loads(r.stdout), [30, 15], r.stderr)
+
+    def test_page_defaults_match_the_script(self):
+        # Before the script runs (and with nothing saved) the page must show
+        # the settings the script will actually use.
+        js, html = read_web("phone.js"), read_web("phone.html")
+        defaults = dict(re.findall(r"(\w+): '([^']+)'",
+                                   re.search(r"const settings = \{(.*?)\};", js).group(1)))
+        for name, value in defaults.items():
+            options = re.search(rf'<select id="{name}".*?</select>', html, re.S).group(0)
+            selected = re.findall(r'value="([^"]+)" selected', options)
+            first = re.findall(r'value="([^"]+)"', options)[0]
+            self.assertEqual((selected or [first])[0], value, f"{name} default")
 
     def test_every_setting_choice_is_known_to_the_script(self):
         js, html = read_web("phone.js"), read_web("phone.html")

@@ -36,6 +36,7 @@ def snapshot():
         "cam_fps": round(cam_meter.per_sec, 1),
         "cam_kb_per_sec": round(cam_meter.bytes_per_sec / 1000),
         "cam_skipped": camera.cam.skipped if camera.cam else 0,
+        "cam_codec": camera.cam.codec if camera.cam else None,
         "mic_kb_per_sec": round(mic_meter.bytes_per_sec / 1000),
         "mic_buffer_ms": audio.mic_buffer_ms(),
     }

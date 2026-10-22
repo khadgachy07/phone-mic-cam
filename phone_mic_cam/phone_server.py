@@ -68,14 +68,23 @@ async def video_handler(request):
     if camera.try_enable_camera() is None:
         await ws.close(code=4000, message=b"no virtual camera")
         return ws
+    codec = request.query.get("codec", "jpeg")
+    if codec not in camera.CODECS:
+        codec = "jpeg"
+    camera.cam.set_codec(codec)
     clients.add(ws)
     cam_clients.add(ws)
-    print(f"Phone camera connected from {request.remote}")
+    print(f"Phone camera connected from {request.remote} ({'H.264' if codec == 'h264' else 'JPEG'})")
     try:
         async for msg in ws:
-            if msg.type == WSMsgType.BINARY and msg.data[:2] == b"\xff\xd8":   # JPEG
+            if msg.type != WSMsgType.BINARY:
+                continue
+            if codec == "jpeg" and msg.data[:2] == b"\xff\xd8":
                 stats.cam_meter.add(len(msg.data))
                 camera.cam.push(msg.data)
+            elif codec == "h264" and msg.data[:1] in (b"\x00", b"\x01"):    # keyframe flag
+                stats.cam_meter.add(len(msg.data))
+                camera.cam.push(msg.data[1:], key=msg.data[0] == 1)
     finally:
         clients.discard(ws)
         cam_clients.discard(ws)

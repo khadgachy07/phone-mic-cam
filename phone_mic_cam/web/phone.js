@@ -128,17 +128,21 @@ document.addEventListener('visibilitychange', () => {
 
 // ------------------------------------------------------------ camera
 const CAM_W = 1280, CAM_H = 720, CAM_FPS = 30, NO_CAMERA = 4000;
-// The PC always shows 1280x720 (it scales 480p up), so changing a setting
-// never needs a new camera permission or breaks an app using Phone Cam.
-const SIZES = {'720': [1280, 720], '480': [854, 480]};
+// Capture at 1080p and scale down to what's sent: phone cameras give more
+// detail at 1080p than at 720p, so the 720p picture comes out sharper.
+const CAPTURE_W = 1920, CAPTURE_H = 1080;
+// The PC always shows 1920x1080 (it scales smaller sizes up), so changing a
+// setting never needs a new camera permission or breaks an app using Phone Cam.
+const SIZES = {'1080': [1920, 1080], '720': [1280, 720], '480': [854, 480]};
 const QUALITY = {high: 0.85, medium: 0.7, low: 0.5};
-const settings = {size: '720', fps: '30', quality: 'medium'};
+const settings = {size: '1080', fps: '30', quality: 'high'};
 const camBtn = document.getElementById('cambtn'), flipBtn = document.getElementById('flip'),
       video = document.getElementById('preview'), camSt = document.getElementById('camstatus');
 const canvas = document.createElement('canvas');
 canvas.width = CAM_W; canvas.height = CAM_H;
 const g = canvas.getContext('2d');
 let camStream, camWs, camTimer, camRunning = false, encoding = false, facing = 'user';
+let codec = 'jpeg', can1080 = false;      // 'h264' where the browser can encode it
 // Safari can grant the camera but refuse to play the preview (frames are
 // copied from it) outside a tap; then the next tap only starts the preview.
 let previewBlocked = false;
@@ -148,8 +152,8 @@ const camSay = t => camSt.textContent = t;
 let camReconnect;
 function camConnect() {
   clearTimeout(camReconnect);
-  const sock = camWs = new WebSocket(`wss://${location.host}/video?t=${TOKEN}`);
-  sock.onopen = () => { if (sock === camWs) camSay('Camera live: your PC is seeing you'); };
+  const sock = camWs = new WebSocket(`wss://${location.host}/video?t=${TOKEN}&codec=${codec}`);
+  sock.onopen = () => { if (sock === camWs) { needKey = true; camSay(liveStatus()); } };
   sock.onclose = e => {
     if (sock !== camWs) return;
     if (e.code === NO_CAMERA) {
@@ -165,7 +169,7 @@ async function openCamera() {
   let step = 'permission';
   try {
     camStream = await navigator.mediaDevices.getUserMedia({video: {
-      facingMode: facing, width: {ideal: CAM_W}, height: {ideal: CAM_H}, frameRate: {ideal: CAM_FPS} }});
+      facingMode: facing, width: {ideal: CAPTURE_W}, height: {ideal: CAPTURE_H}, frameRate: {ideal: CAM_FPS} }});
     step = 'preview';
     video.srcObject = camStream;
     video.classList.toggle('mirror', facing === 'user');
@@ -189,10 +193,132 @@ function nextQuality(a, target, buffered) {
   if (a.q < target && a.calm + 1 >= 30) return {q: Math.min(target, a.q + 0.1), calm: 0, wait: 0};
   return {q: Math.min(a.q, target), calm: a.calm + 1, wait: 0};
 }
-let adapt = {q: 1, calm: 0, wait: 0}, lastSent = 0, wifiBusy = false;
+let adapt = {q: 1, calm: 0, wait: 0}, lastSent = 0, wifiBusy = false, upright = false;
+// Phone Cam is landscape: an upright phone's picture fills only about a third
+// of it, between black bars, so the page asks for the phone to be turned.
+const liveStatus = () =>
+  upright ? 'Camera live. Turn your phone sideways for a full, sharper picture.'
+  : wifiBusy ? 'Camera live (lower quality: Wi-Fi is busy)'
+  : 'Camera live: your PC is seeing you';
 // Whether a camera frame arriving now should be sent at this fps; the slack
 // absorbs jitter, so at 15 fps every other frame of a 30 fps camera goes.
 const frameDue = (now, last, fps) => now - last >= 1000 / fps - 8;
+
+// ------------------------------------------------------------ H.264
+// The phone's hardware H.264 encoder (WebCodecs) sends only what changed
+// between frames: a much better picture than a JPEG per frame for the same
+// data, which makes 1080p practical. Browsers without it use the JPEG path.
+const BITRATE = {'1080': 6e6, '720': 3.5e6, '480': 1.5e6};   // bits/s at High quality
+const KEY_EVERY = 2000;                    // ms; a decoder can only join at a keyframe
+const avcConfig = (w, h, bitrate, fps) => ({
+  codec: w > 1280 ? 'avc1.42e028' : 'avc1.42e01f',      // Constrained Baseline 4.0 / 3.1
+  width: w, height: h, bitrate, framerate: fps, latencyMode: 'realtime',
+  avc: {format: 'avc'},                    // the format every browser supports
+});
+let enc = null, encCfg = null, avcc = null, needKey = true, lastKey = 0;
+
+// Returns [codec, whether 1080p can be encoded].
+async function pickCodec() {
+  if (!('VideoEncoder' in window) || !('VideoFrame' in window)) return ['jpeg', false];
+  const ok = async (w, h) => {
+    try { return (await VideoEncoder.isConfigSupported(avcConfig(w, h, BITRATE['720'], 30))).supported; }
+    catch (e) { return false; }
+  };
+  if (!await ok(1280, 720)) return ['jpeg', false];
+  return ['h264', await ok(1920, 1080)];
+}
+
+// 1080p only with H.264: as JPEG it would need several times the data.
+const sentSize = () =>
+  settings.size === '1080' && !(codec === 'h264' && can1080) ? '720' : settings.size;
+
+// Once the camera has started, make the size menu match what is sent: where
+// 1080p can't be used it's shown as unavailable, and the size in use is
+// selected. The saved choice stays 1080p, for a phone that can use it later.
+function showSizes() {
+  const select = document.getElementById('size');
+  const option = select.querySelector('option[value="1080"]');
+  const ok = codec === 'h264' && can1080;
+  option.disabled = !ok;
+  option.textContent = ok ? '1080p' : '1080p (not supported)';
+  select.value = sentSize();
+}
+
+// The encoder's 'avc' output: NAL units with length prefixes, and the
+// SPS/PPS parameter sets in a separate avcC record. ffmpeg reads the plain
+// Annex B stream: start codes, with the parameter sets before each keyframe
+// so the PC can start decoding at any keyframe.
+function parseAvcC(desc) {
+  const b = ArrayBuffer.isView(desc) ? new Uint8Array(desc.buffer, desc.byteOffset, desc.byteLength)
+                                     : new Uint8Array(desc);
+  const lenSize = (b[4] & 3) + 1, sets = [];
+  let i = 5;
+  for (let n = b[i++] & 31; n > 0; n--) { const l = b[i] << 8 | b[i + 1]; sets.push(b.slice(i + 2, i + 2 + l)); i += 2 + l; }
+  for (let n = b[i++]; n > 0; n--) { const l = b[i] << 8 | b[i + 1]; sets.push(b.slice(i + 2, i + 2 + l)); i += 2 + l; }
+  return {lenSize, sets};
+}
+
+// One WebSocket message: a byte saying keyframe (1) or not (0), then Annex B.
+// The avcC's parameter sets go in front of a keyframe only when it doesn't
+// carry its own: Firefox's avcC is malformed (it repeats each set's first
+// byte), but its keyframes include correct sets.
+function toAnnexB(data, avc, key) {
+  const START = [0, 0, 0, 1], nals = [];
+  for (let i = 0; i + avc.lenSize <= data.length;) {
+    let len = 0;
+    for (let k = 0; k < avc.lenSize; k++) len = len * 256 + data[i + k];
+    i += avc.lenSize;
+    nals.push(data.subarray(i, i + len));
+    i += len;
+  }
+  const parts = [[key ? 1 : 0]];
+  if (key && !nals.some(n => (n[0] & 31) === 7)) for (const set of avc.sets) parts.push(START, set);
+  for (const n of nals) parts.push(START, n);
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function closeEncoder() {
+  if (enc && enc.state !== 'closed') enc.close();
+  enc = encCfg = avcc = null;
+}
+
+// The encoder failed: carry on with JPEG on a new connection.
+function useJpeg(e) {
+  report('camera', {name: 'EncoderError', message: String(e && e.message || e), step: 'h264'});
+  closeEncoder(); codec = 'jpeg';
+  showSizes();
+  if (camRunning) { const old = camWs; camConnect(); if (old) old.close(); }
+}
+
+function encodeFrame(now, w, h) {
+  if (!enc) enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      if (meta && meta.decoderConfig && meta.decoderConfig.description)
+        avcc = parseAvcC(meta.decoderConfig.description);
+      if (!avcc || !camWs || camWs.readyState !== 1) return;
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      camWs.send(toAnnexB(data, avcc, chunk.type === 'key'));
+    },
+    error: useJpeg,
+  });
+  const bitrate = Math.round(BITRATE[sentSize()] * adapt.q / QUALITY.high);
+  const fps = Number(settings.fps);
+  if (!encCfg || encCfg.width !== w || encCfg.bitrate !== bitrate || encCfg.framerate !== fps) {
+    encCfg = avcConfig(w, h, bitrate, fps);
+    enc.configure(encCfg);
+    needKey = true;
+  }
+  if (enc.encodeQueueSize > 1) return;     // the encoder is behind: skip this frame
+  const frame = new VideoFrame(canvas, {timestamp: Math.round(now * 1000)});
+  const key = needKey || now - lastKey >= KEY_EVERY;
+  enc.encode(frame, {keyFrame: key});
+  frame.close();
+  if (key) { needKey = false; lastKey = now; }
+}
 
 function sendFrame() {
   const vw = video.videoWidth, vh = video.videoHeight;
@@ -201,17 +327,20 @@ function sendFrame() {
   if (!frameDue(now, lastSent, Number(settings.fps))) return;
   const target = QUALITY[settings.quality];
   adapt = nextQuality(adapt, target, camWs.bufferedAmount);
-  if (wifiBusy !== adapt.q < target) {
-    wifiBusy = adapt.q < target;
-    camSay(wifiBusy ? 'Camera live (lower quality: Wi-Fi is busy)' : 'Camera live: your PC is seeing you');
+  if (wifiBusy !== adapt.q < target || upright !== vh > vw) {
+    wifiBusy = adapt.q < target; upright = vh > vw;
+    camSay(liveStatus());
   }
   if (camWs.bufferedAmount > 256 * 1024) return;      // Wi-Fi is far behind: skip a frame
-  const [cw, ch] = SIZES[settings.size];
+  const [cw, ch] = SIZES[sentSize()];
   if (canvas.width !== cw) { canvas.width = cw; canvas.height = ch; }
+  g.imageSmoothingQuality = 'high';       // reset by a resize; sharper downscaling from 1080p
   const s = Math.min(cw / vw, ch / vh), w = vw * s, h = vh * s;
   g.fillStyle = '#000'; g.fillRect(0, 0, cw, ch);
   g.drawImage(video, (cw - w) / 2, (ch - h) / 2, w, h);
-  encoding = true; lastSent = now;
+  lastSent = now;
+  if (codec === 'h264') return encodeFrame(now, cw, ch);
+  encoding = true;
   canvas.toBlob(b => { encoding = false; if (b && camWs && camWs.readyState === 1) camWs.send(b); },
                 'image/jpeg', adapt.q);
 }
@@ -237,14 +366,17 @@ function startFrameLoop() {
 async function startCam() {
   if (previewBlocked) { previewBlocked = false; await video.play(); }   // inside the tap
   else await openCamera();
+  [codec, can1080] = await pickCodec();
+  showSizes();
   camRunning = true; camConnect(); keepAwake();
-  adapt = {q: 1, calm: 0, wait: 0}; wifiBusy = false;
+  adapt = {q: 1, calm: 0, wait: 0}; wifiBusy = false; upright = false;
   startFrameLoop();
   camBtn.textContent = 'Stop camera'; camBtn.classList.add('on');
 }
 
 function stopCam() {
   camRunning = false; previewBlocked = false;
+  closeEncoder();
   loopId++;
   clearTimeout(camReconnect);
   clearInterval(camTimer);
@@ -285,7 +417,7 @@ video.onclick = () => {
 };
 // However the preview restarts (that tap, or autoplay), clear the paused message.
 video.addEventListener('playing', () => {
-  if (camRunning && camWs && camWs.readyState === 1) camSay('Camera live: your PC is seeing you');
+  if (camRunning && camWs && camWs.readyState === 1) camSay(liveStatus());
 });
 
 // ------------------------------------------------------------ settings

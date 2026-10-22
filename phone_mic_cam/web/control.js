@@ -30,7 +30,8 @@ async function refresh() {
   document.getElementById('micstats').textContent =
     s.mic_connected && t.mic_kb_per_sec ? `${t.mic_kb_per_sec} KB/s · ${t.mic_buffer_ms} ms lag` : '';
   document.getElementById('camstats').textContent = s.cam_connected
-    ? `${t.cam_fps} fps · ${t.cam_kb_per_sec.toLocaleString()} KB/s · ${t.cam_skipped} frames skipped`
+    ? `${t.cam_codec === 'h264' ? 'H.264' : 'JPEG'} · ${t.cam_fps} fps · ` +
+      `${t.cam_kb_per_sec.toLocaleString()} KB/s · ${t.cam_skipped} frames skipped`
     : '';
 }
 document.getElementById('stop').onclick = async () => {
