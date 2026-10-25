@@ -31,7 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(ROOT, "phone_mic_cam", "web")
 sys.path.insert(0, ROOT)
 import phone_mic_cam  # noqa: E402
-from phone_mic_cam import app, audio, camera, control_page, phone_server, stats  # noqa: E402
+from phone_mic_cam import app, audio, camera, control_page, phone_server, sounds, stats  # noqa: E402
 
 
 def read_web(name):
@@ -51,6 +51,9 @@ def reset_state():
     stats.cam_meter = stats.Meter()
     with audio.buf_lock:
         audio.buf.clear()
+    sounds.listeners.clear()
+    sounds.last = None
+    sounds._last_at = 0.0
 
 
 def phone_app():
@@ -180,6 +183,30 @@ class PhoneServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(camera.cam.frames, [b"\xff\xd8 a jpeg"])
         self.assertEqual(stats.cam_meter.count, 1)
         await ws.close()
+
+    async def test_phone_sound_messages_are_checked_before_use(self):
+        heard = []
+        async def fake_heard(kind):
+            heard.append(kind)
+        with mock.patch.object(sounds, "heard", fake_heard), contextlib.redirect_stdout(io.StringIO()):
+            ws = await self.client.ws_connect(f"/ws?t={phone_server.TOKEN}")
+            await ws.receive()                                     # "on"/"off"
+            for text in ('{"sound": "clap"}', '{"sound": "whistle"}', 'not json', '["clap"]',
+                         '{"sound": "snap", "x": "' + "y" * 100 + '"}', '{"sound": "snap"}'):
+                await ws.send_str(text)
+            for _ in range(50):
+                if len(heard) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            await ws.close()
+        self.assertEqual(heard, ["clap", "snap"])
+
+    def test_sounds_faster_than_the_phone_can_detect_are_ignored(self):
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            asyncio.run(sounds.heard("clap"))
+            asyncio.run(sounds.heard("clap"))                      # 0 s later
+        self.assertEqual(log.getvalue().count("Clap heard"), 1)
 
     async def test_video_h264_strips_the_keyframe_flag(self):
         camera.cam = FakeCam()
@@ -364,6 +391,69 @@ class ControlPageTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.status_of(self.base + "/?t=wrong"), 403)
         # DNS rebinding: right address and token, but another site's host name
         self.assertEqual(await self.status_of(self.url, headers={"Host": "evil.example"}), 403)
+
+    async def test_events_pass_on_each_clap_and_snap_the_phone_hears(self):
+        events = await self.session.ws_connect(self.url.replace("http://", "ws://").replace("/?t=", "/events?t="))
+        for _ in range(50):
+            if sounds.listeners:
+                break
+            await asyncio.sleep(0.01)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            await sounds.heard("clap")
+            sounds._last_at = 0.0
+            await sounds.heard("snap")
+        first = json.loads((await events.receive(timeout=2)).data)
+        second = json.loads((await events.receive(timeout=2)).data)
+        self.assertEqual((first["event"], second["event"]), ("clap", "snap"))
+        self.assertAlmostEqual(first["time"], time.time(), delta=5)
+        self.assertIn("Clap heard", log.getvalue())
+        async with self.session.get(f"{self.base}/status?t={phone_server.TOKEN}") as resp:
+            self.assertEqual((await resp.json())["last_sound"]["kind"], "snap")
+        await events.close()
+
+    async def test_a_clap_from_the_phone_reaches_a_listening_app(self):
+        # The whole path: the phone's mic socket -> the control page's /events.
+        phone = TestClient(TestServer(phone_app()))
+        await phone.start_server()
+        try:
+            events = await self.session.ws_connect(
+                self.url.replace("http://", "ws://").replace("/?t=", "/events?t="))
+            for _ in range(50):
+                if sounds.listeners:
+                    break
+                await asyncio.sleep(0.01)
+            with contextlib.redirect_stdout(io.StringIO()):
+                mic = await phone.ws_connect(f"/ws?t={phone_server.TOKEN}")
+                await mic.receive()                                # "on"/"off"
+                await mic.send_str('{"sound": "clap"}')
+                event = json.loads((await events.receive(timeout=2)).data)
+                await mic.close()
+            self.assertEqual(event["event"], "clap")
+            await events.close()
+        finally:
+            await phone.close()
+
+    async def test_events_need_token_and_local_host(self):
+        ws_base = self.base.replace("http://", "ws://")
+        for url, headers in ((f"{ws_base}/events", {}), (f"{ws_base}/events?t=wrong", {}),
+                             (f"{ws_base}/events?t={phone_server.TOKEN}", {"Host": "evil.example"})):
+            with self.assertRaises(aiohttp.WSServerHandshakeError, msg=url) as e:
+                await self.session.ws_connect(url, headers=headers)
+            self.assertEqual(e.exception.status, 403)
+
+    async def test_stop_closes_event_listeners(self):
+        events = await self.session.ws_connect(self.url.replace("http://", "ws://").replace("/?t=", "/events?t="))
+        for _ in range(50):
+            if sounds.listeners:
+                break
+            await asyncio.sleep(0.01)
+        await self.stop(None)
+        msg = await events.receive(timeout=2)
+        self.assertEqual(msg.type, aiohttp.WSMsgType.CLOSE)
+        self.start, self.stop = (None, self.noop_stop)
+
+    async def noop_stop(self, app):
+        pass
 
     async def test_status_reports_state_and_stats(self):
         camera.camera_problem = "no driver"
@@ -731,6 +821,69 @@ console.log('ok');
 
     def test_no_terminal_mentioned_to_phone_users(self):
         self.assertNotIn("terminal", phone_server.PAGE)
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class ClapDetectorTest(unittest.TestCase):
+    """Runs the phone page's clap and snap detector in node on synthetic sounds."""
+
+    HARNESS = r"""
+%s
+globalThis.soundStep = soundStep; globalThis.newSoundState = newSoundState;
+const S = require(%s);
+function scene(build, secs = 2, roomNoise = 0.002) {
+  const b = S.buf(secs); S.add(b, 0, S.noise(roomNoise, secs)); build(b);
+  const st = newSoundState(), found = [];
+  S.chunks(b).forEach(c => { const k = soundStep(st, c); if (k) found.push(k); });
+  return found.join(' ');
+}
+const syllables = amp => b => { for (let t = 0; t < 1.9; t += 0.25) S.add(b, t, S.syllable(amp)); };
+console.log(JSON.stringify({
+  'clap': scene(b => S.add(b, 0.5, S.clap())),
+  'quiet clap (far away)': scene(b => S.add(b, 0.5, S.clap(0.12))),
+  'snap': scene(b => S.add(b, 0.5, S.snap())),
+  'double clap 0.3 s apart': scene(b => { S.add(b, 0.5, S.clap()); S.add(b, 0.8, S.clap()); }),
+  'fast double clap 0.2 s': scene(b => { S.add(b, 0.5, S.clap()); S.add(b, 0.7, S.clap()); }),
+  'snap then clap': scene(b => { S.add(b, 0.5, S.snap()); S.add(b, 1.0, S.clap()); }),
+  'clap mid-word': scene(b => { syllables(0.05)(b); S.add(b, 1.12, S.clap()); }),
+  'clap as a word starts': scene(b => { syllables(0.05)(b); S.add(b, 1.0, S.clap()); }),
+  'clap, noisy room': scene(b => { S.add(b, 0, S.noise(0.015, 2)); S.add(b, 0.5, S.clap()); }),
+  'clap, echoey room': scene(b => S.add(b, 0.5, S.burst(1800, 0.7, 0.5, 0.008, 0.6, 0.0005, 0.25))),
+  'speech ta-ta-ta': scene(syllables(0.3)),
+  'loud speech': scene(syllables(0.7)),
+  // each "t" comes out of silence, as bright and sudden as a snap; only the
+  // vowel right after it shows it isn't one
+  'words with pauses': scene(b => { for (let t = 0.4; t < 1.8; t += 0.6) S.add(b, t, S.syllable(0.5)); }),
+  'music notes': scene(b => { for (let t = 0.1; t < 1.8; t += 0.3)
+    S.add(b, t, S.tone([262 * (1 + t), 330 * (1 + t), 392 * (1 + t)], 0.4, 0.28)); }),
+  'door thud': scene(b => S.add(b, 0.5, S.thud())),
+  'faint key clicks': scene(b => { for (let t = 0.2; t < 1.8; t += 0.15) S.add(b, t, S.burst(5000, 1, 0.03, 0.001, 0.01)); }),
+  'steady fan noise': scene(b => S.add(b, 0, S.noise(0.05, 2))),
+  'vacuum switched on': scene(b => S.add(b, 0.7, S.noise(0.3, 1.3))),
+}));
+"""
+    EXPECTED = {
+        "clap": "clap", "quiet clap (far away)": "clap", "snap": "snap",
+        "double clap 0.3 s apart": "clap clap", "fast double clap 0.2 s": "clap clap",
+        "snap then clap": "snap clap", "clap mid-word": "clap", "clap as a word starts": "clap",
+        "clap, noisy room": "clap", "clap, echoey room": "clap",
+        # none of these may count
+        "speech ta-ta-ta": "", "loud speech": "", "words with pauses": "", "music notes": "", "door thud": "",
+        "faint key clicks": "", "steady fan noise": "", "vacuum switched on": "",
+    }
+
+    def test_hears_claps_and_snaps_but_not_other_sounds(self):
+        js = read_web("phone.js")
+        detector = re.search(r"const CLAP = \{.*?\n\};\n.*?function soundStep\(.*?\n\}\n", js, re.S)
+        self.assertIsNotNone(detector, "the detector wasn't found in the phone page")
+        fixture = json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "clap_sounds.js"))
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(self.HARNESS % (detector.group(0), fixture))
+        try:
+            r = subprocess.run(["node", f.name], capture_output=True, text=True)
+        finally:
+            os.remove(f.name)
+        self.assertEqual(json.loads(r.stdout or "null"), self.EXPECTED, r.stderr)
 
 
 @unittest.skipUnless(shutil.which("node"), "node not installed")

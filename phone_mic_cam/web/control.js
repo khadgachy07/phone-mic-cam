@@ -23,6 +23,11 @@ async function refresh() {
   if (s.camera_problem) show('cam', 'Not available');
   else if (s.cam_connected) show('cam', 'Live as "Phone Cam"', 'live');
   else show('cam', 'Ready: tap Start camera on your phone', 'on');
+  const heard = s.last_sound;
+  document.getElementById('sound').textContent =
+    !s.mic_connected ? 'Start the phone mic to detect claps and snaps'
+    : heard ? `${heard.kind === 'snap' ? 'Snap' : 'Clap'} heard ${Math.round(heard.seconds_ago)} s ago`
+    : 'Listening for claps and snaps';
   const fix = document.getElementById('camfix');
   fix.textContent = s.camera_problem || '';
   fix.style.display = s.camera_problem ? 'block' : 'none';

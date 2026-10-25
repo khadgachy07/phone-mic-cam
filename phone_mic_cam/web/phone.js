@@ -32,14 +32,14 @@ const MIC_BACKLOG = 48000 * 2 * 0.15;
 const say = t => st.textContent = t;
 
 // The PC sends 'on' while an app there records from the mic, 'off' when none
-// does; the mic only captures and sends audio while 'on'.
+// does; audio is only sent while 'on'. The mic itself keeps listening in
+// Ready, for claps and snaps (below), but nothing it hears there is sent.
 let live = false;
 function setLive(on) {
   live = on;
-  if (stream) stream.getAudioTracks().forEach(t => t.enabled = on);
   if (!on) lvl.style.width = '0';
   say(on ? 'Live: your PC is hearing you'
-         : 'Ready: turns on when an app on your PC uses the mic');
+         : 'Ready: listening for claps; turns on when an app on your PC uses the mic');
 }
 
 // Only the current socket may change state or reconnect; a pending reconnect
@@ -70,10 +70,14 @@ async function start() {
   await ctx.audioWorklet.addModule(url);
   const node = new AudioWorkletNode(ctx, 'pcm');
   ctx.createMediaStreamSource(stream).connect(node).connect(ctx.destination);
+  sound = newSoundState();
   node.port.onmessage = e => {
+    const s = new Int16Array(e.data);
+    const heard = soundStep(sound, s);
+    if (heard) soundHeard(heard);
     if (!live) return;
     if (ws && ws.readyState === 1 && ws.bufferedAmount < MIC_BACKLOG) ws.send(e.data);
-    const s = new Int16Array(e.data); let p = 0;
+    let p = 0;
     for (let i = 0; i < s.length; i += 8) p = Math.max(p, Math.abs(s[i]));
     lvl.style.width = Math.min(100, p / 200) + '%';
   };
@@ -92,6 +96,69 @@ function stop() {
   ctx = stream = ws = wakeLock = null;
   lvl.style.width = '0';
   btn.textContent = 'Start mic'; btn.classList.remove('on'); say('Stopped');
+}
+
+// ------------------------------------------------------------ claps and snaps
+// While the mic runs (Ready or Live), each 10 ms of sound is checked for a clap
+// or a finger snap: a sudden, bright burst that dies away within a tenth of a
+// second and is followed by quiet. Speech and music are too dull, or carry on
+// (a spoken "t" is followed by its vowel), and steady noise doesn't jump.
+const CLAP = {
+  floor: 0.02,        // RMS a burst must reach (-34 dBFS): ignores faint clicks
+  jump: 8,            // burst energy against the room's background and the last 10 ms
+  brightHz: 2000,     // claps and snaps are brighter than voices (~900) and music
+  snapDrop: 0.05,     // a snap is gone within 10 ms: below this share of its peak
+  decay: 0.2,         // the burst falls below this share of its peak energy...
+  maxChunks: 10,      // ...within this many 10 ms chunks, or it's a longer sound
+  quietChunks: 8,     // ...then stays below half its peak this long (80 ms)
+  gapMs: 20,          // after one, the next can start this soon (fast double claps)
+  warmupMs: 300,      // learn the room's background before listening
+};
+const newSoundState = () => ({bg: 0, prev: 0, last: 0, hit: null, t: 0, quietUntil: CLAP.warmupMs});
+
+// Feed one chunk of 48 kHz 16-bit samples; returns 'clap', 'snap' or null.
+function soundStep(st, x) {
+  let e = 0, d = 0, last = st.last;
+  for (let i = 0; i < x.length; i++) {
+    const v = x[i] / 32768, dv = v - last;
+    e += v * v; d += dv * dv; last = v;
+  }
+  st.last = last; e /= x.length; d /= x.length; st.t += 10;
+  // Brightness: a sine at f Hz has d/e = 4 sin²(pi f / 48000), so invert that.
+  const hz = e > 0 ? 48000 / Math.PI * Math.asin(Math.min(1, Math.sqrt(d / e / 4))) : 0;
+  let found = null;
+  const h = st.hit;
+  if (h) {
+    h.n++;
+    if (!h.decayed) {
+      if (e > h.peak) h.peak = e;
+      if (e < CLAP.decay * h.peak) { h.decayed = h.n; h.snap = h.n === 2 && e < CLAP.snapDrop * h.peak; }
+      else if (h.n >= CLAP.maxChunks) end(300);          // a longer sound
+    } else if (e > 0.5 * h.peak) {
+      end(300);                                          // it carries on: speech, not a clap
+    } else if (h.n - h.decayed >= CLAP.quietChunks) {
+      found = h.snap ? 'snap' : 'clap';
+      end(CLAP.gapMs);
+    }
+  } else if (st.t >= st.quietUntil && e > CLAP.floor ** 2 && hz > CLAP.brightHz &&
+             e > CLAP.jump * Math.max(st.bg, st.prev)) {
+    st.hit = {n: 1, peak: e, decayed: 0, snap: false};
+  }
+  if (!st.hit) st.bg = st.bg ? st.bg + 0.05 * (e - st.bg) : e;   // follows the room
+  st.prev = e;
+  return found;
+
+  function end(gap) { st.hit = null; st.quietUntil = st.t + gap; }
+}
+
+// Tell the PC (which passes it on to other apps) and show it here briefly.
+let sound, soundTimer;
+const soundSt = document.getElementById('sound');
+function soundHeard(kind) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({sound: kind}));
+  soundSt.textContent = kind === 'snap' ? 'Snap heard' : 'Clap heard';
+  clearTimeout(soundTimer);
+  soundTimer = setTimeout(() => soundSt.textContent = '', 1500);
 }
 
 // When the browser refuses the mic or camera, tell the PC so its log shows

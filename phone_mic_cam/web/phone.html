@@ -19,6 +19,7 @@
   .status{font-size:17px;opacity:.8;text-align:center;padding:0 16px}
   #bar{width:220px;height:10px;background:#333;border-radius:5px;overflow:hidden}
   #lvl{height:100%;width:0;background:#2c8;transition:width .05s}
+  #sound{min-height:1.4em;color:#fc6;margin-top:-16px}
   select{background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:10px;
          padding:9px 10px;font-size:15px}
   #dim{background:none;border:1px solid #444;color:#aaa;border-radius:12px;
@@ -33,6 +34,7 @@
 <button id="btn">Start mic</button>
 <div id="bar"><div id="lvl"></div></div>
 <div id="status" class="status">Tap to start. Keep this page open.</div>
+<div id="sound" class="status" aria-live="polite"></div>
 <video id="preview" playsinline muted autoplay></video>
 <div class="row"><button id="cambtn">Start camera</button><button id="flip">Flip</button></div>
 <div id="camstatus" class="status"></div>

@@ -98,7 +98,8 @@ After you tap **Start mic** once, the phone shows **Ready**. It switches to
 **Live** by itself whenever an app on the computer starts recording from
 Phone Mic, for example a browser's mic button, a voice chat or a recorder.
 It goes back to **Ready** about 3 seconds after the last app stops. While
-**Ready**, the phone sends no audio.
+**Ready**, the phone keeps listening for claps and snaps (below) but sends no
+audio.
 
 The one tap is needed because phone browsers only allow mic access after the
 user taps something on the page.
@@ -106,6 +107,46 @@ user taps something on the page.
 To stream the mic all the time instead, start it from a terminal with
 `phone-mic-cam --mic-always-on`. It also falls back to always-on if it can't
 watch PulseAudio.
+
+### Claps and snaps
+
+While the phone mic runs, in **Ready** or **Live**, the phone listens for a
+clap or a finger snap: a sudden, sharp sound that dies away within a tenth of
+a second. Speech, music, steady noise and dull thumps don't count. The phone
+shows "Clap heard" or "Snap heard", the control page shows the last one, and
+other apps on this computer can use them, for example as a wake sound.
+
+Those apps connect to a WebSocket on this computer and get one message per
+sound, about 0.1 s after it:
+
+```json
+{"event": "clap", "time": 1793000000.123}
+```
+
+`event` is `clap` or `snap` (the phone's best guess between the two), and
+`time` is when the computer got it, in Unix seconds. Each sound is sent on its
+own; an app wanting, say, a double clap counts them itself.
+
+The address is the control page's, with `/events`: read it from
+`$XDG_RUNTIME_DIR/phone-mic-cam.url`, which only you can read and which exists
+while Phone Mic Cam runs. Like the control page, it only answers on 127.0.0.1
+with its token. In Python with aiohttp, for example:
+
+```python
+import asyncio, os, aiohttp
+
+async def wait_for_claps():
+    with open(os.path.join(os.environ["XDG_RUNTIME_DIR"], "phone-mic-cam.url")) as f:
+        url = f.read().strip().replace("http://", "ws://").replace("/?t=", "/events?t=")
+    async with aiohttp.ClientSession() as session, session.ws_connect(url) as ws:
+        async for msg in ws:
+            print(msg.json())          # {"event": "clap", "time": ...}
+
+asyncio.run(wait_for_claps())
+```
+
+The address and token change each time Phone Mic Cam starts, so read the file
+again after a restart.
 
 ## Uninstall
 
@@ -257,7 +298,8 @@ phone_mic_cam/
 ├── audio.py           Phone Mic: virtual mic, audio writer, automatic on/off
 ├── camera.py          Phone Cam: ffmpeg, frame handling, driver diagnosis
 ├── phone_server.py    what the phone talks to: page, mic, camera, error reports
-├── control_page.py    the control page on this computer: status, Stop, reopening
+├── control_page.py    the control page on this computer: status, Stop, /events, reopening
+├── sounds.py          claps and snaps from the phone, passed on to other apps
 ├── stats.py           live numbers shown on the control page
 └── web/
     ├── phone.html  phone.js      the page on the phone

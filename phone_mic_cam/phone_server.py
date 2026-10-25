@@ -8,7 +8,7 @@ import time
 
 from aiohttp import web, WSCloseCode, WSMsgType
 
-from . import audio, camera, stats
+from . import audio, camera, sounds, stats
 
 WEB = importlib.resources.files(__package__) / "web"
 
@@ -53,6 +53,10 @@ async def ws_handler(request):
             if msg.type == WSMsgType.BINARY:
                 stats.mic_meter.add(len(msg.data))
                 audio.feed(msg.data)
+            elif msg.type == WSMsgType.TEXT:             # a clap or snap the phone heard
+                kind = sounds.parse(msg.data)
+                if kind:
+                    await sounds.heard(kind)
     finally:
         clients.discard(ws)
         audio.mic_clients.discard(ws)

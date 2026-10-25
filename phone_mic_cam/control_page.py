@@ -6,13 +6,14 @@ import os
 import signal
 import socket
 import tempfile
+import time
 import webbrowser
 
 import qrcode
 import qrcode.image.svg
-from aiohttp import __version__ as aiohttp_version, web
+from aiohttp import __version__ as aiohttp_version, web, WSCloseCode
 
-from . import audio, camera, phone_server, stats
+from . import audio, camera, phone_server, sounds, stats
 
 AIOHTTP_3_9 = tuple(int(p) for p in aiohttp_version.split(".")[:2]) >= (3, 9)
 
@@ -46,14 +47,30 @@ def hooks(phone_url, open_browser):
         return web.Response(text=page, content_type="text/html")
 
     async def status(request):
+        last = sounds.last
         return web.json_response({
             "mic_connected": bool(audio.mic_clients),
+            "last_sound": last and {"kind": last["kind"],
+                                    "seconds_ago": round(time.time() - last["time"], 1)},
             "mic_live": audio.mic_wanted,
             "mic_always_on": audio.mic_always_on,
             "cam_connected": bool(phone_server.cam_clients),
             "camera_problem": camera.camera_problem,
             "stats": stats.snapshot(),
         })
+
+    async def events(request):
+        """Other apps on this computer (e.g. one woken by a clap) get each clap
+        or snap the phone hears: {"event": "clap" or "snap", "time": <unix time>}."""
+        ws = web.WebSocketResponse(heartbeat=30)
+        await ws.prepare(request)
+        sounds.listeners.add(ws)
+        try:
+            async for _ in ws:
+                pass                 # nothing to receive; just wait until it closes
+        finally:
+            sounds.listeners.discard(ws)
+        return ws
 
     async def stop_app(request):
         print("Stop pressed on the control page")
@@ -66,6 +83,7 @@ def hooks(phone_url, open_browser):
         desk = web.Application(middlewares=[local_only])
         desk.router.add_get("/", show)
         desk.router.add_get("/status", status)
+        desk.router.add_get("/events", events)
         desk.router.add_post("/stop", stop_app)
         # aiohttp 3.9 moved shutdown_timeout from the site to the runner;
         # Ubuntu 22.04 has 3.8, where the runner passes it on and breaks requests.
@@ -88,6 +106,8 @@ def hooks(phone_url, open_browser):
             os.remove(CONTROL_FILE)
         except FileNotFoundError:
             pass
+        for ws in list(sounds.listeners):
+            await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutdown")
         if runner:
             await runner.cleanup()
 
